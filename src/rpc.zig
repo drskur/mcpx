@@ -164,6 +164,11 @@ pub fn getString(value: Value, key: []const u8) ?[]const u8 {
     return if (value_at_key == .string) value_at_key.string else null;
 }
 
+pub fn getInteger(value: Value, key: []const u8) ?i64 {
+    const value_at_key = get(value, key) orelse return null;
+    return if (value_at_key == .integer) value_at_key.integer else null;
+}
+
 pub fn jsonString(allocator: Allocator, value: Value) ![]u8 {
     var output: Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
