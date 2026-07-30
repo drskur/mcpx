@@ -1,0 +1,133 @@
+const std = @import("std");
+
+const Io = std.Io;
+const Value = std.json.Value;
+const rpc = @import("rpc.zig");
+
+const max_response_size = 16 * 1024 * 1024;
+
+pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64) anyerror!?Value {
+    const uri = try std.Uri.parse(self.server.endpoint);
+    var extra: std.ArrayList(std.http.Header) = .empty;
+    defer extra.deinit(self.allocator);
+    try extra.append(self.allocator, .{ .name = "Accept", .value = "application/json, text/event-stream" });
+    try extra.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = self.negotiated_version });
+    const sent_session = self.session_id != null;
+    if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
+    if (self.server.headers) |headers| {
+        var it = headers.map.iterator();
+        while (it.next()) |entry| {
+            if (isReservedHeader(entry.key_ptr.*)) {
+                std.debug.print("warning: skipping reserved configured header '{s}'\n", .{entry.key_ptr.*});
+                continue;
+            }
+            try extra.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+        }
+    }
+
+    var req = try self.http.request(.POST, uri, .{
+        .headers = .{
+            .accept_encoding = .omit,
+            .content_type = .{ .override = "application/json" },
+        },
+        .extra_headers = extra.items,
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    var request_body = try req.sendBodyUnflushed(&.{});
+    try request_body.writer.writeAll(body);
+    try request_body.end();
+    try req.connection.?.flush();
+    var response = try req.receiveHead(&.{});
+    const status = response.head.status;
+    const content_type = try self.allocator.dupe(u8, response.head.content_type orelse "");
+    const reason = try self.allocator.dupe(u8, response.head.reason);
+    if (self.session_id == null) {
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "Mcp-Session-Id")) {
+            self.session_id = try self.allocator.dupe(u8, h.value);
+            break;
+        };
+    }
+    if (sent_session and status == .not_found) return error.SessionExpired;
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+    const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
+    if (status.class() == .success and !notification and std.ascii.eqlIgnoreCase(base_type, "text/event-stream"))
+        return try rpc.parseSseReader(self, reader, expected_id orelse return error.MissingExpectedResponseId);
+
+    var output: Io.Writer.Allocating = .init(self.allocator);
+    defer output.deinit();
+    while (output.written().len <= max_response_size) {
+        const remaining = max_response_size + 1 - output.written().len;
+        _ = reader.stream(&output.writer, .limited(remaining)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+    }
+    if (output.written().len > max_response_size) return error.ResponseTooLarge;
+    const text = output.written();
+    if (status.class() != .success) {
+        std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, text });
+        return error.HttpRequestFailed;
+    }
+    if (notification) return null;
+    if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
+        return try rpc.parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
+    std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
+    return error.UnsupportedContentType;
+}
+
+pub fn waitForTimeout(io: Io, seconds: u64) void {
+    const limited_seconds = @min(seconds, @as(u64, std.math.maxInt(i64)));
+    Io.Timeout.sleep(.{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(@intCast(limited_seconds)),
+    } }, io) catch {};
+}
+
+pub fn notifyCancelled(self: anytype, id: i64) !void {
+    var params = Value{ .object = .empty };
+    try params.object.put(self.allocator, "requestId", .{ .integer = id });
+    var note = Value{ .object = .empty };
+    try note.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
+    try note.object.put(self.allocator, "method", .{ .string = "notifications/cancelled" });
+    try note.object.put(self.allocator, "params", params);
+    const body = try rpc.jsonString(self.allocator, note);
+    _ = try self.requestExpected(body, true, null, false, false);
+}
+
+pub fn respondPing(self: anytype, id: Value) !void {
+    var response = Value{ .object = .empty };
+    try response.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
+    try response.object.put(self.allocator, "id", id);
+    try response.object.put(self.allocator, "result", .{ .object = .empty });
+    try sendServerResponse(self, response);
+}
+
+pub fn respondMethodNotFound(self: anytype, id: Value) !void {
+    var response = Value{ .object = .empty };
+    try response.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
+    try response.object.put(self.allocator, "id", id);
+    var rpc_error = Value{ .object = .empty };
+    try rpc_error.object.put(self.allocator, "code", .{ .integer = -32601 });
+    try rpc_error.object.put(self.allocator, "message", .{ .string = "Method not found" });
+    try response.object.put(self.allocator, "error", rpc_error);
+    try sendServerResponse(self, response);
+}
+
+fn sendServerResponse(self: anytype, response: Value) !void {
+    const body = try rpc.jsonString(self.allocator, response);
+    if (self.test_server_responses) |responses| {
+        try responses.append(self.allocator, body);
+        return;
+    }
+    _ = try self.requestExpected(body, true, null, false, false);
+}
+
+fn isReservedHeader(name: []const u8) bool {
+    const reserved = [_][]const u8{ "accept", "content-type", "mcp-protocol-version", "mcp-session-id" };
+    for (reserved) |candidate| if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    return false;
+}
