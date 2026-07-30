@@ -34,8 +34,14 @@ pub fn parseArgs(args: []const []const u8) !ParsedArgs {
             count += 1;
         }
     }
-    const cmd = command orelse return error.MissingCommand;
-    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "schema") or std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
+    const cmd = command orelse return .{
+        .config = config,
+        .command = "",
+        .positionals = undefined,
+        .positionals_len = 0,
+        .help = true,
+    };
+    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
     if (count < needed) return error.MissingArgument;
     return .{ .config = config, .command = cmd, .positionals = positions, .positionals_len = count };
 }
@@ -51,7 +57,6 @@ pub fn writeUsage(io: Io) !void {
         \\Commands:
         \\  servers
         \\  list <server>
-        \\  schema <server> <tool>
         \\  call <server> <tool> [json_args]
         \\  skills <server> [tool]
         \\
@@ -64,4 +69,9 @@ test "argument parser accepts global config flag" {
     try std.testing.expectEqualStrings("skills", parsed.command);
     try std.testing.expectEqualStrings("test.toml", parsed.config.?);
     try std.testing.expectEqualStrings("search", parsed.positionals[1]);
+}
+
+test "argument parser treats no arguments as help" {
+    const parsed = try parseArgs(&.{"mcpx"});
+    try std.testing.expect(parsed.help);
 }

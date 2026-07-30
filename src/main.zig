@@ -87,9 +87,6 @@ fn run(init: std.process.Init) !void {
             const desc = tool.description() orelse "";
             try out.print("{s}\t{s}\n", .{ name, firstLine(desc) });
         }
-    } else if (std.mem.eql(u8, parsed.command, "schema")) {
-        const tool = findTool(tools, parsed.positionals[1]) orelse return toolNotFound(parsed.positionals[1]);
-        try skills.prettyPrint(out, tool.value);
     } else if (std.mem.eql(u8, parsed.command, "skills")) {
         if (parsed.positionals_len > 1) {
             const tool = findTool(tools, parsed.positionals[1]) orelse return toolNotFound(parsed.positionals[1]);

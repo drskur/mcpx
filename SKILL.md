@@ -1,11 +1,13 @@
 # mcpx — CLI Bridge for MCP HTTP Servers
 
-Use when you need to discover or invoke tools exposed by MCP (Model Context Protocol) HTTP servers from the command line. mcpx connects to any MCP server over HTTP (JSON-RPC 2.0 + SSE), lists tools, shows schemas, calls tools, and renders tool documentation as LLM-friendly markdown.
+Use mcpx to discover and invoke tools exposed by Model Context Protocol (MCP) HTTP servers. It uses JSON-RPC 2.0 over HTTP, accepts JSON and SSE responses, calls tools, and renders tool documentation as LLM-friendly markdown.
 
 ## Prerequisites
 
-- `mcpx` binary on PATH (built from this repo with `zig build -Doptimize=ReleaseFast`)
-- Config file at `~/.config/mcpx/config.toml` (or pass `-c PATH`)
+- `mcpx` binary on `PATH` (build it from this repository with `zig build -Doptimize=ReleaseFast`)
+- A config file at `~/.config/mcpx/config.toml`, or a path supplied with `-c PATH` / `--config PATH`
+
+Without an explicit config path, mcpx requires `HOME` and reads `$HOME/.config/mcpx/config.toml`.
 
 ## Config Format
 
@@ -20,9 +22,22 @@ Authorization = "Bearer ***"
 X-Custom = "value"
 ```
 
-Multiple `[[http]]` blocks register multiple servers.
+Multiple `[[http]]` blocks register multiple servers. `-c` and `--config` are global flags and work anywhere in the argument list, including after the command or its positionals.
 
-## Commands
+## Usage and Commands
+
+Running `mcpx` with no arguments, or with `-h` / `--help`, prints usage and exits successfully.
+
+```text
+mcpx [-c PATH] <COMMAND>
+
+mcpx servers
+mcpx list <server>
+mcpx call <server> <tool> [json_args]
+mcpx skills <server> [tool]
+```
+
+The parser accepts at most three positional arguments after the command. Commands may therefore accept surplus positionals until that shared limit; a fourth produces `TooManyArguments`. Do not rely on surplus arguments being meaningful.
 
 ### List configured servers
 
@@ -30,7 +45,7 @@ Multiple `[[http]]` blocks register multiple servers.
 mcpx servers
 ```
 
-Output: `name\tendpoint` per line.
+Output is `name\tendpoint` per line. If the config contains no servers, output is `no servers configured.`
 
 ### List tools on a server
 
@@ -38,15 +53,7 @@ Output: `name\tendpoint` per line.
 mcpx list <server>
 ```
 
-Output: `tool_name\tfirst_line_of_description` per line.
-
-### Show tool JSON schema
-
-```bash
-mcpx schema <server> <tool>
-```
-
-Output: pretty-printed JSON of the tool definition (name, description, inputSchema, outputSchema).
+Output is `tool_name\tfirst_line_of_description` per line. If the server returns no tools, output is `no tools available.`
 
 ### Call a tool
 
@@ -54,55 +61,68 @@ Output: pretty-printed JSON of the tool definition (name, description, inputSche
 mcpx call <server> <tool> '{"key": "value"}'
 ```
 
-- Third argument is optional; defaults to `{}`.
-- Must be valid JSON object.
-- Output: pretty-printed JSON result from the server.
+The JSON argument is optional and defaults to `{}`. It must reach mcpx as one shell argument, must be valid JSON, and must be an object. Single quotes are recommended in shells that support them, but any quoting that delivers one argument works. `call` sends the supplied tool name directly to the server; it does not first check whether that name appeared in `tools/list`.
 
-### Render tool documentation as markdown (skills)
+Output is the server's JSON result, pretty-printed.
+
+### Render tool documentation as markdown
 
 ```bash
 mcpx skills <server>           # all tools
-mcpx skills <server> <tool>    # single tool
+mcpx skills <server> <tool>    # one tool
 ```
 
-Output: markdown with `## tool_name`, description, `### Parameters` / `### Returns` sections. Each parameter shows name, type, required flag, constraints (enum, min/max, pattern, default), and description. Nested objects and arrays are rendered recursively with indentation.
+Single-tool mode looks up the tool locally and reports `ToolNotFound` if it is absent. Output uses `## tool_name`, the description, and `### Parameters` / `### Returns` sections.
+
+The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, `minimum`, `maximum`, `pattern`, and `default`. It recursively renders nested `properties`, plus array `items` that contain `properties` or `$ref`. A `$ref` is displayed but not resolved. A definition without `properties` falls back to a raw JSON block.
 
 ## Typical Workflow for an LLM Agent
 
-1. **Discover**: `mcpx servers` → pick a server.
-2. **Explore**: `mcpx skills <server>` → read markdown to understand available tools and their parameters.
-3. **Invoke**: `mcpx call <server> <tool> '{...}'` → get structured JSON result.
-4. **Inspect**: `mcpx schema <server> <tool>` → raw JSON schema if you need exact field types.
+1. **Discover**: `mcpx servers` and select a server.
+2. **Explore**: `mcpx skills <server>` and read the rendered tool documentation.
+3. **Invoke**: `mcpx call <server> <tool> '{...}'` and consume the structured result.
 
-## Exit Codes
+## Protocol Behavior and Limits
 
-- `0` — success
-- `1` — any error (message printed to stderr)
+- mcpx proposes MCP protocol version `2025-03-26` and accepts negotiated versions `2025-03-26` and `2024-11-05`; other versions produce `UnsupportedProtocolVersion`.
+- Before `tools/list` or `tools/call`, mcpx checks the initialized server's `capabilities.tools`; absence produces `ServerDoesNotSupportTools`.
+- One stateful MCP session is initialized per invocation. The first `Mcp-Session-Id` is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
+- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
+- Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
+- SSE response bodies are fully buffered before parsing. Responses are matched to the numeric JSON-RPC request ID, not selected merely because they are the last event with `result` or `error`. Events containing `method` are treated as server requests (with an `id`) or notifications (without one); server requests receive a method-not-found response.
+- All `tools/list` pages are fetched automatically. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
-## Error Messages (stderr)
+## Exit Codes and Errors
 
-| Message | Cause |
-|---------|-------|
-| `cannot read config file: PATH` | Config missing or unreadable |
-| `failed to parse config PATH: ERR` | Invalid TOML |
-| `server 'X' not found. available: ...` | Wrong server name |
-| `tool 'X' not found` | Wrong tool name |
-| `request to URL timed out after N seconds` | Server too slow / unreachable |
-| `HTTP NNN reason: body` | Non-2xx response |
-| `RPC error [code]: message` | JSON-RPC error from server |
-| `unsupported response Content-Type: T` | Server returned neither JSON nor SSE |
+Success exits `0`; any error exits `1`. Every error prints a final `error: ErrorName` line to stderr, including errors that first print a more descriptive line.
 
-## Pitfalls
-
-- The `-c` flag must come **before** the command: `mcpx -c alt.toml list srv` ✓, `mcpx list srv -c alt.toml` ✗ (parsed as positional).
-- `call` arguments must be a single shell-quoted JSON string. Use single quotes: `'{"q": "hello"}'`.
-- Servers using SSE transport return multiple JSON-RPC frames; mcpx automatically extracts the last one with a `result` or `error` field.
-- `Mcp-Session-Id` is captured from the first response and sent on subsequent requests within the same invocation. Each `mcpx` call is a fresh session.
-- Pagination (`nextCursor`) is handled automatically for `tools/list`.
+| Error or preceding message | Cause |
+|---|---|
+| `MissingCommand` | No longer emitted: no arguments prints usage and exits `0` |
+| `UnknownCommand` | Command name is not recognized |
+| `MissingArgument` | Command lacks a required server or tool positional |
+| `MissingConfigPath` | `-c` / `--config` has no following path |
+| `TooManyArguments` | More than three positional arguments follow the command |
+| `ArgsNotValidJson` | Tool arguments are not valid JSON |
+| `ArgsMustBeObject` | Tool arguments are valid JSON but not an object |
+| `HomeNotSet` | No config flag was supplied and `HOME` is unavailable |
+| `cannot read config file: PATH` then `ConfigReadFailed` | Config is missing or unreadable |
+| `failed to parse config PATH: ERR` then `ConfigParseFailed` | TOML is invalid |
+| `server 'X' not found. available: ...` then `ServerNotFound` | Server name is not configured |
+| `tool 'X' not found` then `ToolNotFound` | Tool name is absent in `skills` single-tool mode |
+| `ServerDoesNotSupportTools` | Initialized capabilities do not advertise tools |
+| `SessionExpired` | A session-bound request received 404 and the one recovery attempt did not succeed |
+| `request to URL timed out after N seconds` then `RequestTimedOut` | The explicit request timer expired |
+| `ResponseTooLarge` | Response body exceeded 16 MiB |
+| `RepeatedPaginationCursor` | A tools-list cursor repeated |
+| `UnsupportedProtocolVersion` | Server negotiated neither supported MCP version |
+| `HTTP NNN reason: body` then `HttpRequestFailed` | Server returned a non-2xx response |
+| `RPC error [code]: message` then `JsonRpcError` | Server returned a JSON-RPC error |
+| `unsupported response Content-Type: T` then `UnsupportedContentType` | Response was neither JSON nor SSE |
 
 ## Building
 
 ```bash
-zig build -Doptimize=ReleaseFast   # → zig-out/bin/mcpx (~1MB, stripped)
-zig build test                     # run unit tests
+zig build -Doptimize=ReleaseFast
+zig build test
 ```

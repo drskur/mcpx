@@ -37,7 +37,6 @@ configuration file.
 ```text
 mcpx servers
 mcpx list <server>
-mcpx schema <server> <tool>
 mcpx call <server> <tool> [json_args]
 mcpx skills <server> [tool]
 ```
