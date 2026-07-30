@@ -7,137 +7,22 @@ const Value = std.json.Value;
 const version = "0.1.0";
 const protocol_version = "2025-03-26";
 
-const Header = struct { name: []const u8, value: []const u8 };
+const toml = @import("toml");
+
 const Server = struct {
-    name: []const u8 = "",
-    endpoint: []const u8 = "",
-    headers: []const Header = &.{},
-    timeout_secs: u64 = 30,
+    name: []const u8,
+    endpoint: []const u8,
+    headers: ?toml.HashMap([]const u8) = null,
+    timeout_secs: ?u64 = null,
+
+    fn timeoutSecs(self: Server) u64 {
+        return self.timeout_secs orelse 30;
+    }
 };
 
 const Config = struct {
-    servers: []const Server,
-
-    fn parse(allocator: Allocator, raw: []const u8) !Config {
-        var servers: std.ArrayList(Server) = .empty;
-        var current: ?Server = null;
-        var headers: std.ArrayList(Header) = .empty;
-
-        var lines = std.mem.splitScalar(u8, raw, '\n');
-        var line_no: usize = 0;
-        while (lines.next()) |untrimmed| {
-            line_no += 1;
-            const line = std.mem.trim(u8, stripComment(untrimmed), " \t\r");
-            if (line.len == 0) continue;
-            if (std.mem.eql(u8, line, "[[http]]")) {
-                if (current) |*server| {
-                    server.headers = try headers.toOwnedSlice(allocator);
-                    try validateServer(server.*, line_no - 1);
-                    try servers.append(allocator, server.*);
-                }
-                current = .{};
-                headers = .empty;
-                continue;
-            }
-            if (current == null) return error.ConfigKeyOutsideHttpSection;
-            const equal = findUnquoted(line, '=') orelse return error.InvalidConfigAssignment;
-            const key = std.mem.trim(u8, line[0..equal], " \t");
-            const val = std.mem.trim(u8, line[equal + 1 ..], " \t");
-            if (std.mem.eql(u8, key, "name")) {
-                current.?.name = try parseString(allocator, val);
-            } else if (std.mem.eql(u8, key, "endpoint")) {
-                current.?.endpoint = try parseString(allocator, val);
-            } else if (std.mem.eql(u8, key, "timeout_secs")) {
-                current.?.timeout_secs = std.fmt.parseInt(u64, val, 10) catch return error.InvalidTimeout;
-            } else if (std.mem.eql(u8, key, "headers")) {
-                try parseHeaders(allocator, val, &headers);
-            } else {
-                return error.UnknownConfigKey;
-            }
-        }
-        if (current) |*server| {
-            server.headers = try headers.toOwnedSlice(allocator);
-            try validateServer(server.*, line_no);
-            try servers.append(allocator, server.*);
-        }
-        return .{ .servers = try servers.toOwnedSlice(allocator) };
-    }
+    http: []const Server = &.{},
 };
-
-fn validateServer(server: Server, line: usize) !void {
-    _ = line;
-    if (server.name.len == 0) return error.ServerMissingName;
-    if (server.endpoint.len == 0) return error.ServerMissingEndpoint;
-    if (server.timeout_secs == 0) return error.InvalidTimeout;
-    for (server.headers) |header| {
-        if (header.name.len == 0 or std.mem.indexOfAny(u8, header.name, "\r\n") != null) return error.InvalidHeaderName;
-        if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) return error.InvalidHeaderValue;
-    }
-}
-
-fn stripComment(line: []const u8) []const u8 {
-    var quoted = false;
-    var escaped = false;
-    for (line, 0..) |c, i| {
-        if (escaped) {
-            escaped = false;
-        } else if (c == '\\' and quoted) {
-            escaped = true;
-        } else if (c == '"') {
-            quoted = !quoted;
-        } else if (c == '#' and !quoted) {
-            return line[0..i];
-        }
-    }
-    return line;
-}
-
-fn findUnquoted(s: []const u8, needle: u8) ?usize {
-    var quoted = false;
-    var escaped = false;
-    for (s, 0..) |c, i| {
-        if (escaped) escaped = false else if (c == '\\' and quoted) escaped = true else if (c == '"') quoted = !quoted else if (c == needle and !quoted) return i;
-    }
-    return null;
-}
-
-fn parseString(allocator: Allocator, text: []const u8) ![]const u8 {
-    if (text.len < 2 or text[0] != '"' or text[text.len - 1] != '"') return error.ExpectedQuotedString;
-    var out: Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var i: usize = 1;
-    while (i + 1 < text.len) : (i += 1) {
-        if (text[i] != '\\') {
-            try out.writer.writeByte(text[i]);
-            continue;
-        }
-        i += 1;
-        if (i + 1 > text.len) return error.InvalidStringEscape;
-        try out.writer.writeByte(switch (text[i]) {
-            '"', '\\' => text[i],
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            else => return error.InvalidStringEscape,
-        });
-    }
-    return out.toOwnedSlice();
-}
-
-fn parseHeaders(allocator: Allocator, text: []const u8, headers: *std.ArrayList(Header)) !void {
-    if (text.len < 2 or text[0] != '{' or text[text.len - 1] != '}') return error.InvalidHeadersMap;
-    var rest = std.mem.trim(u8, text[1 .. text.len - 1], " \t");
-    while (rest.len != 0) {
-        const equal = findUnquoted(rest, '=') orelse return error.InvalidHeadersMap;
-        const key_text = std.mem.trim(u8, rest[0..equal], " \t");
-        const comma = findUnquoted(rest[equal + 1 ..], ',');
-        const value_end = if (comma) |n| equal + 1 + n else rest.len;
-        const value_text = std.mem.trim(u8, rest[equal + 1 .. value_end], " \t");
-        const key = if (key_text.len > 0 and key_text[0] == '"') try parseString(allocator, key_text) else try allocator.dupe(u8, key_text);
-        try headers.append(allocator, .{ .name = key, .value = try parseString(allocator, value_text) });
-        rest = if (comma != null) std.mem.trim(u8, rest[value_end + 1 ..], " \t") else "";
-    }
-}
 
 const Tool = struct {
     value: Value,
@@ -187,13 +72,13 @@ const McpClient = struct {
         var completions: [2]Result = undefined;
         var select: Io.Select(Result) = .init(self.io, &completions);
         try select.concurrent(.response, requestInner, .{ self, body, notification });
-        try select.concurrent(.timeout, waitForTimeout, .{ self.io, self.server.timeout_secs });
+        try select.concurrent(.timeout, waitForTimeout, .{ self.io, self.server.timeoutSecs() });
         const result = try select.await();
         select.cancelDiscard();
         return switch (result) {
             .response => |response| response,
             .timeout => {
-                std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, self.server.timeout_secs });
+                std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, self.server.timeoutSecs() });
                 return error.RequestTimedOut;
             },
         };
@@ -206,7 +91,10 @@ const McpClient = struct {
         try extra.append(self.allocator, .{ .name = "Accept", .value = "application/json, text/event-stream" });
         try extra.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = self.negotiated_version });
         if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
-        for (self.server.headers) |h| try extra.append(self.allocator, .{ .name = h.name, .value = h.value });
+        if (self.server.headers) |headers| {
+            var it = headers.map.iterator();
+            while (it.next()) |entry| try extra.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+        }
 
         var req = try self.http.request(.POST, uri, .{
             .headers = .{
@@ -359,18 +247,22 @@ fn run(init: std.process.Init) !void {
         std.debug.print("cannot read config file: {s}\n", .{path});
         return error.ConfigReadFailed;
     };
-    const config = Config.parse(allocator, raw) catch |err| {
+    var parser = toml.Parser(Config).init(allocator);
+    defer parser.deinit();
+    var parsed_config = parser.parseString(raw) catch |err| {
         std.debug.print("failed to parse config {s}: {s}\n", .{ path, @errorName(err) });
-        return err;
+        return error.ConfigParseFailed;
     };
+    defer parsed_config.deinit();
+    const config = parsed_config.value;
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file.interface;
     defer out.flush() catch {};
 
     if (std.mem.eql(u8, parsed.command, "servers")) {
-        if (config.servers.len == 0) return out.writeAll("no servers configured.\n");
-        for (config.servers) |s| try out.print("{s}\t{s}\n", .{ s.name, s.endpoint });
+        if (config.http.len == 0) return out.writeAll("no servers configured.\n");
+        for (config.http) |s| try out.print("{s}\t{s}\n", .{ s.name, s.endpoint });
         return;
     }
     const server_name = parsed.positionals[0];
@@ -470,12 +362,12 @@ fn writeUsage(io: Io) !void {
 }
 
 fn findServer(config: Config, name: []const u8) ?Server {
-    for (config.servers) |s| if (std.mem.eql(u8, s.name, name)) return s;
+    for (config.http) |s| if (std.mem.eql(u8, s.name, name)) return s;
     return null;
 }
 fn printMissingServer(config: Config, name: []const u8) !void {
     std.debug.print("server '{s}' not found. available: ", .{name});
-    for (config.servers, 0..) |s, i| std.debug.print("{s}{s}", .{ if (i == 0) "" else ", ", s.name });
+    for (config.http, 0..) |s, i| std.debug.print("{s}{s}", .{ if (i == 0) "" else ", ", s.name });
     std.debug.print("\n", .{});
 }
 fn findTool(tools: []const Tool, name: []const u8) ?Tool {
@@ -590,15 +482,20 @@ test "SSE returns last response" {
     try std.testing.expectEqual(@as(i64, 2), get(value, "page").?.integer);
 }
 
-test "config parses servers, headers, escapes, and defaults" {
+test "config parses servers via toml library" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const config = try Config.parse(arena.allocator(),
+    var parser = toml.Parser(Config).init(arena.allocator());
+    defer parser.deinit();
+    var parsed_config = try parser.parseString(
         \\# mcpx test configuration
         \\[[http]]
         \\name = "one"
         \\endpoint = "http://127.0.0.1:3000/mcp"
-        \\headers = { Authorization = "Bearer token", "X-Label" = "a,b" }
+        \\
+        \\[http.headers]
+        \\Authorization = "Bearer token"
+        \\X-Label = "a,b"
         \\
         \\[[http]]
         \\name = "two"
@@ -606,10 +503,13 @@ test "config parses servers, headers, escapes, and defaults" {
         \\timeout_secs = 60
         \\
     );
-    try std.testing.expectEqual(@as(usize, 2), config.servers.len);
-    try std.testing.expectEqual(@as(u64, 30), config.servers[0].timeout_secs);
-    try std.testing.expectEqualStrings("a,b", config.servers[0].headers[1].value);
-    try std.testing.expectEqual(@as(u64, 60), config.servers[1].timeout_secs);
+    defer parsed_config.deinit();
+    const config = parsed_config.value;
+    try std.testing.expectEqual(@as(usize, 2), config.http.len);
+    try std.testing.expectEqual(@as(u64, 30), config.http[0].timeoutSecs());
+    try std.testing.expectEqual(@as(u64, 60), config.http[1].timeoutSecs());
+    const headers = config.http[0].headers.?;
+    try std.testing.expectEqualStrings("a,b", headers.map.get("X-Label").?);
 }
 
 test "argument parser accepts global config flag" {

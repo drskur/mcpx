@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip: ?bool = if (optimize != .Debug) true else null;
+    const toml_dep = b.dependency("toml", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const exe = b.addExecutable(.{
         .name = "mcpx",
         .root_module = b.createModule(.{
@@ -11,6 +15,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .imports = &.{
+                .{ .name = "toml", .module = toml_dep.module("toml") },
+            },
         }),
     });
     b.installArtifact(exe);
