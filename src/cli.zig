@@ -1,0 +1,67 @@
+const std = @import("std");
+const Io = std.Io;
+
+pub const ParsedArgs = struct {
+    config: ?[]const u8,
+    command: []const u8,
+    positionals: [3][]const u8,
+    positionals_len: usize,
+    help: bool = false,
+};
+
+pub fn parseArgs(args: []const []const u8) !ParsedArgs {
+    var config: ?[]const u8 = null;
+    var command: ?[]const u8 = null;
+    var positions: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .{
+            .config = config,
+            .command = "",
+            .positionals = undefined,
+            .positionals_len = 0,
+            .help = true,
+        };
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i == args.len) return error.MissingConfigPath;
+            config = args[i];
+        } else if (command == null) command = arg else {
+            if (count == positions.len) return error.TooManyArguments;
+            positions[count] = arg;
+            count += 1;
+        }
+    }
+    const cmd = command orelse return error.MissingCommand;
+    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "schema") or std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
+    if (count < needed) return error.MissingArgument;
+    return .{ .config = config, .command = cmd, .positionals = positions, .positionals_len = count };
+}
+
+pub fn writeUsage(io: Io) !void {
+    var buffer: [2048]u8 = undefined;
+    var file: Io.File.Writer = .init(.stdout(), io, &buffer);
+    try file.interface.writeAll(
+        \\mcpx 0.1.0 - CLI bridge for MCP HTTP servers
+        \\
+        \\Usage: mcpx [-c PATH] <COMMAND>
+        \\
+        \\Commands:
+        \\  servers
+        \\  list <server>
+        \\  schema <server> <tool>
+        \\  call <server> <tool> [json_args]
+        \\  skills <server> [tool]
+        \\
+    );
+    try file.interface.flush();
+}
+
+test "argument parser accepts global config flag" {
+    const parsed = try parseArgs(&.{ "mcpx", "skills", "demo", "search", "-c", "test.toml" });
+    try std.testing.expectEqualStrings("skills", parsed.command);
+    try std.testing.expectEqualStrings("test.toml", parsed.config.?);
+    try std.testing.expectEqualStrings("search", parsed.positionals[1]);
+}
