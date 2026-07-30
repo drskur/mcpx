@@ -6,7 +6,7 @@ const rpc = @import("rpc.zig");
 
 const max_response_size = 16 * 1024 * 1024;
 
-pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64) anyerror!?Value {
+pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64, initialize_request: bool) anyerror!?Value {
     const uri = try std.Uri.parse(self.server.endpoint);
     var extra: std.ArrayList(std.http.Header) = .empty;
     defer extra.deinit(self.allocator);
@@ -37,14 +37,16 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     var request_body = try req.sendBodyUnflushed(&.{});
     try request_body.writer.writeAll(body);
     try request_body.end();
-    try req.connection.?.flush();
+    const connection = req.connection orelse return error.TransportConnectionMissing;
+    try connection.flush();
     var response = try req.receiveHead(&.{});
     const status = response.head.status;
     const content_type = try self.allocator.dupe(u8, response.head.content_type orelse "");
     const reason = try self.allocator.dupe(u8, response.head.reason);
-    if (self.session_id == null) {
+    if (initialize_request and self.session_id == null) {
         var it = response.head.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "Mcp-Session-Id")) {
+            if (!isValidSessionId(h.value)) return error.InvalidSessionId;
             self.session_id = try self.allocator.dupe(u8, h.value);
             break;
         };
@@ -54,8 +56,14 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
     const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
-    if (status.class() == .success and !notification and std.ascii.eqlIgnoreCase(base_type, "text/event-stream"))
-        return try rpc.parseSseReader(self, reader, expected_id orelse return error.MissingExpectedResponseId);
+    if (status.class() == .success and !notification and std.ascii.eqlIgnoreCase(base_type, "text/event-stream")) {
+        const result = try rpc.parseSseReader(self, reader, expected_id orelse return error.MissingExpectedResponseId);
+        for (result.pending_server_requests) |pending| {
+            self.respondServerRequest(pending.id, pending.method) catch |err|
+                std.debug.print("failed to respond to server request '{s}': {s}\n", .{ pending.method, @errorName(err) });
+        }
+        return result.response;
+    }
 
     var output: Io.Writer.Allocating = .init(self.allocator);
     defer output.deinit();
@@ -69,7 +77,12 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     if (output.written().len > max_response_size) return error.ResponseTooLarge;
     const text = output.written();
     if (status.class() != .success) {
-        std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, text });
+        const log_limit = 1024;
+        const displayed = text[0..@min(text.len, log_limit)];
+        if (text.len > log_limit)
+            std.debug.print("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
+        else
+            std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
         return error.HttpRequestFailed;
     }
     if (notification) return null;
@@ -95,7 +108,7 @@ pub fn notifyCancelled(self: anytype, id: i64) !void {
     try note.object.put(self.allocator, "method", .{ .string = "notifications/cancelled" });
     try note.object.put(self.allocator, "params", params);
     const body = try rpc.jsonString(self.allocator, note);
-    _ = try self.requestExpected(body, true, null, false, false);
+    _ = try self.requestExpectedWithTimeout(body, true, null, false, false, false, 5);
 }
 
 pub fn respondPing(self: anytype, id: Value) !void {
@@ -127,7 +140,50 @@ fn sendServerResponse(self: anytype, response: Value) !void {
 }
 
 fn isReservedHeader(name: []const u8) bool {
-    const reserved = [_][]const u8{ "accept", "content-type", "mcp-protocol-version", "mcp-session-id" };
+    const reserved = [_][]const u8{
+        "accept",
+        "content-type",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+    };
     for (reserved) |candidate| if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
     return false;
+}
+
+fn isValidSessionId(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (byte < 0x21 or byte > 0x7e) return false;
+    return true;
+}
+
+test "reserved headers include framing and hop-by-hop headers" {
+    try std.testing.expect(isReservedHeader("Content-Length"));
+    try std.testing.expect(isReservedHeader("transfer-encoding"));
+    try std.testing.expect(isReservedHeader("HOST"));
+    try std.testing.expect(isReservedHeader("connection"));
+    try std.testing.expect(isReservedHeader("keep-alive"));
+    try std.testing.expect(isReservedHeader("upgrade"));
+    try std.testing.expect(isReservedHeader("proxy-authorization"));
+    try std.testing.expect(isReservedHeader("proxy-connection"));
+    try std.testing.expect(isReservedHeader("te"));
+    try std.testing.expect(isReservedHeader("trailer"));
+    try std.testing.expect(!isReservedHeader("authorization"));
+}
+
+test "session IDs contain visible ASCII only" {
+    try std.testing.expect(isValidSessionId("abc-123_~"));
+    try std.testing.expect(!isValidSessionId(""));
+    try std.testing.expect(!isValidSessionId("has space"));
+    try std.testing.expect(!isValidSessionId("has\nnewline"));
+    try std.testing.expect(!isValidSessionId(&[_]u8{0x7f}));
 }

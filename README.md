@@ -1,6 +1,6 @@
 # mcpx
 
-A zero-dependency Zig CLI bridge for calling Model Context Protocol HTTP
+A single-binary Zig CLI bridge with no runtime dependencies for calling Model Context Protocol HTTP
 servers directly.
 
 ## Build

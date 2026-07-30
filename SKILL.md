@@ -86,11 +86,11 @@ The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, 
 
 - mcpx proposes and accepts only MCP protocol version `2025-03-26`; other versions produce `UnsupportedProtocolVersion`.
 - Before `tools/list` or `tools/call`, mcpx checks the initialized server's `capabilities.tools`; absence produces `ServerDoesNotSupportTools`.
-- One stateful MCP session is initialized per invocation. The first `Mcp-Session-Id` is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
-- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request, except initialization requests, which MCP prohibits cancelling. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
+- One stateful MCP session is initialized per invocation. `Mcp-Session-Id` is accepted only from the `initialize` response, must contain visible ASCII characters only, and is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
+- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request using a separate fixed 5-second timeout, except initialization requests, which MCP prohibits cancelling. Cancellation therefore adds at most 5 seconds. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
 - Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
-- SSE events are parsed incrementally and a matching numeric JSON-RPC response is returned as soon as it arrives. Events containing `method` are handled inline as server requests (with an `id`) or notifications (without one); `ping` requests receive an empty successful result and other server requests receive method-not-found.
-- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, or `Mcp-Session-Id`; matching names are skipped case-insensitively with a warning.
+- SSE events are parsed incrementally and a matching numeric JSON-RPC response is returned as soon as it arrives. Valid JSON-RPC 2.0 events containing `method` are collected as server requests (with an `id`) or notifications (without one); after the matching response arrives, `ping` requests receive an empty successful result and other server requests receive method-not-found.
+- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning.
 - All `tools/list` pages are fetched automatically. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
 ## Exit Codes and Errors

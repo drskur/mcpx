@@ -40,14 +40,25 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
     return result.?;
 }
 
-fn parseSse(self: anytype, body: []const u8, expected_id: i64) !Value {
+pub const PendingServerRequest = struct {
+    id: Value,
+    method: []const u8,
+};
+
+pub const SseResult = struct {
+    response: Value,
+    pending_server_requests: []const PendingServerRequest,
+};
+
+fn parseSse(self: anytype, body: []const u8, expected_id: i64) !SseResult {
     var reader = Io.Reader.fixed(body);
     return parseSseReader(self, &reader, expected_id);
 }
 
-pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !Value {
+pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !SseResult {
     const allocator = self.allocator;
     var last_parse_error: ?anyerror = null;
+    var pending_server_requests: std.ArrayList(PendingServerRequest) = .empty;
     var data: Io.Writer.Allocating = .init(allocator);
     defer data.deinit();
     var line: Io.Writer.Allocating = .init(allocator);
@@ -77,7 +88,8 @@ pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !Valu
         const text = std.mem.trimEnd(u8, line.written(), "\r");
         if (text.len == 0) {
             if (data.written().len != 0) {
-                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error)) |result| return result;
+                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error, &pending_server_requests)) |response|
+                    return .{ .response = response, .pending_server_requests = try pending_server_requests.toOwnedSlice(allocator) };
                 data.clearRetainingCapacity();
             }
         } else if (std.mem.startsWith(u8, text, "data:")) {
@@ -86,7 +98,8 @@ pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !Valu
         }
         if (end_of_stream) {
             if (data.written().len != 0)
-                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error)) |result| return result;
+                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error, &pending_server_requests)) |response|
+                    return .{ .response = response, .pending_server_requests = try pending_server_requests.toOwnedSlice(allocator) };
             break;
         }
     }
@@ -97,16 +110,25 @@ pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !Valu
     return error.SseMissingResponse;
 }
 
-fn processSseEvent(self: anytype, data: []const u8, expected_id: i64, last_parse_error: *?anyerror) !?Value {
+fn processSseEvent(
+    self: anytype,
+    data: []const u8,
+    expected_id: i64,
+    last_parse_error: *?anyerror,
+    pending_server_requests: *std.ArrayList(PendingServerRequest),
+) !?Value {
     const rpc = std.json.parseFromSliceLeaky(Value, self.allocator, data, .{}) catch |err| {
         last_parse_error.* = err;
         return null;
     };
     const events = if (rpc == .array) rpc.array.items else &[_]Value{rpc};
     for (events) |event| {
-        if (getString(event, "method")) |method| {
-            if (get(event, "id")) |id| self.respondServerRequest(id, method) catch |err|
-                std.debug.print("failed to respond to server request '{s}': {s}\n", .{ method, @errorName(err) });
+        const jsonrpc = getString(event, "jsonrpc");
+        const valid_jsonrpc = jsonrpc != null and std.mem.eql(u8, jsonrpc.?, "2.0");
+        if (valid_jsonrpc and getString(event, "method") != null) {
+            const method = getString(event, "method").?;
+            if (get(event, "id")) |id|
+                try pending_server_requests.append(self.allocator, .{ .id = id, .method = method });
         } else if (responseIdMatches(event, expected_id)) {
             const encoded = try jsonString(self.allocator, event);
             return try parseRpc(self.allocator, encoded, expected_id);
@@ -135,21 +157,7 @@ fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
     return if (value == .string) value.string else jsonString(allocator, value);
 }
 
-const TestClient = struct {
-    allocator: Allocator,
-    responses: *std.ArrayList([]u8),
-
-    fn respondServerRequest(self: *@This(), id: Value, method: []const u8) !void {
-        var response = Value{ .object = .empty };
-        try response.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
-        try response.object.put(self.allocator, "id", id);
-        if (std.mem.eql(u8, method, "ping"))
-            try response.object.put(self.allocator, "result", .{ .object = .empty })
-        else
-            return error.UnexpectedMethod;
-        try self.responses.append(self.allocator, try jsonString(self.allocator, response));
-    }
-};
+const TestClient = struct { allocator: Allocator };
 
 test "parseRpc rejects mismatched id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -186,29 +194,33 @@ test "validateRpcResponse rejects non-2.0 jsonrpc" {
 test "parseSse matches by id not last event" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var responses: std.ArrayList([]u8) = .empty;
-    var client = TestClient{ .allocator = arena.allocator(), .responses = &responses };
-    const value = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"wrong\":true}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":2}}\n\n", 1);
-    try std.testing.expectEqual(@as(i64, 1), get(value, "page").?.integer);
+    var client = TestClient{ .allocator = arena.allocator() };
+    const result = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"wrong\":true}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":2}}\n\n", 1);
+    try std.testing.expectEqual(@as(i64, 1), get(result.response, "page").?.integer);
 }
 
 test "parseSse handles server ping request" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var responses: std.ArrayList([]u8) = .empty;
-    var client = TestClient{ .allocator = arena.allocator(), .responses = &responses };
-    _ = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
-    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
-    const response = try std.json.parseFromSliceLeaky(Value, arena.allocator(), responses.items[0], .{});
-    try std.testing.expect(get(response, "result").? == .object);
-    try std.testing.expectEqual(@as(usize, 0), get(response, "result").?.object.count());
+    var client = TestClient{ .allocator = arena.allocator() };
+    const result = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
+    try std.testing.expectEqual(@as(usize, 1), result.pending_server_requests.len);
+    try std.testing.expectEqual(@as(i64, 9), result.pending_server_requests[0].id.integer);
+    try std.testing.expectEqualStrings("ping", result.pending_server_requests[0].method);
 }
 
 test "parseSse handles server notification without response" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var responses: std.ArrayList([]u8) = .empty;
-    var client = TestClient{ .allocator = arena.allocator(), .responses = &responses };
-    _ = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
-    try std.testing.expectEqual(@as(usize, 0), responses.items.len);
+    var client = TestClient{ .allocator = arena.allocator() };
+    const result = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
+    try std.testing.expectEqual(@as(usize, 0), result.pending_server_requests.len);
+}
+
+test "parseSse ignores method-bearing messages without JSON-RPC 2.0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client = TestClient{ .allocator = arena.allocator() };
+    const result = try parseSse(&client, "data: {\"jsonrpc\":\"1.0\",\"id\":9,\"method\":\"ping\"}\n\ndata: {\"id\":10,\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
+    try std.testing.expectEqual(@as(usize, 0), result.pending_server_requests.len);
 }

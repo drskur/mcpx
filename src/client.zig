@@ -65,8 +65,12 @@ pub const McpClient = struct {
         const negotiated = rpc_module.getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
         if (!std.mem.eql(u8, negotiated, protocol_version)) return error.UnsupportedProtocolVersion;
         self.negotiated_version = negotiated;
-        const capabilities = rpc_module.get(initialized, "capabilities");
-        self.supports_tools = if (capabilities) |c| rpc_module.get(c, "tools") != null else false;
+        const capabilities = rpc_module.get(initialized, "capabilities") orelse return error.InitializeMissingCapabilities;
+        if (capabilities != .object) return error.InitializeCapabilitiesMustBeObject;
+        const server_info = rpc_module.get(initialized, "serverInfo") orelse return error.InitializeMissingServerInfo;
+        if (server_info != .object) return error.InitializeServerInfoMustBeObject;
+        _ = rpc_module.getString(server_info, "name") orelse return error.InitializeServerInfoMissingName;
+        self.supports_tools = rpc_module.get(capabilities, "tools") != null;
         try self.notifyInitialized();
     }
 
@@ -75,11 +79,24 @@ pub const McpClient = struct {
     }
 
     pub fn requestExpected(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, allow_session_recovery: bool, cancellable: bool) anyerror!?Value {
+        return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, false, self.server.timeoutSecs());
+    }
+
+    pub fn requestExpectedWithTimeout(
+        self: *McpClient,
+        body: []const u8,
+        notification: bool,
+        expected_id: ?i64,
+        allow_session_recovery: bool,
+        cancellable: bool,
+        initialize_request: bool,
+        timeout_secs: u64,
+    ) anyerror!?Value {
         const Result = union(enum) { response: anyerror!?Value, timeout: void };
         var completions: [2]Result = undefined;
         var select: Io.Select(Result) = .init(self.io, &completions);
-        try select.concurrent(.response, requestInner, .{ self, body, notification, expected_id });
-        try select.concurrent(.timeout, transport.waitForTimeout, .{ self.io, self.server.timeoutSecs() });
+        try select.concurrent(.response, requestInner, .{ self, body, notification, expected_id, initialize_request });
+        try select.concurrent(.timeout, transport.waitForTimeout, .{ self.io, timeout_secs });
         const result = try select.await();
         select.cancelDiscard();
         return switch (result) {
@@ -89,13 +106,14 @@ pub const McpClient = struct {
                     self.negotiated_version = protocol_version;
                     self.supports_tools = false;
                     try self.connect();
-                    return self.requestExpected(body, notification, expected_id, false, cancellable);
+                    return self.requestExpectedWithTimeout(body, notification, expected_id, false, cancellable, initialize_request, timeout_secs);
                 }
                 return err;
             },
             .timeout => {
-                std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, self.server.timeoutSecs() });
-                if (cancellable) if (expected_id) |id| transport.notifyCancelled(self, id) catch {};
+                std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, timeout_secs });
+                if (cancellable) if (expected_id) |id| transport.notifyCancelled(self, id) catch |err|
+                    std.debug.print("failed to send cancellation for request {d}: {s}\n", .{ id, @errorName(err) });
                 return error.RequestTimedOut;
             },
         };
@@ -112,7 +130,16 @@ pub const McpClient = struct {
         if (params) |p| try request_value.object.put(self.allocator, "params", p);
         self.next_id += 1;
         const body = try rpc_module.jsonString(self.allocator, request_value);
-        return (try self.requestExpected(body, false, request_id, true, !std.mem.eql(u8, method, "initialize"))).?;
+        const initialize_request = std.mem.eql(u8, method, "initialize");
+        return (try self.requestExpectedWithTimeout(
+            body,
+            false,
+            request_id,
+            true,
+            !initialize_request,
+            initialize_request,
+            self.server.timeoutSecs(),
+        )).?;
     }
 
     fn notifyInitialized(self: *McpClient) !void {
@@ -120,7 +147,7 @@ pub const McpClient = struct {
         try note.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
         try note.object.put(self.allocator, "method", .{ .string = "notifications/initialized" });
         const body = try rpc_module.jsonString(self.allocator, note);
-        _ = try self.request(body, true);
+        _ = try self.requestExpected(body, true, null, false, false);
     }
 
     pub fn respondServerRequest(self: *McpClient, id: Value, method: []const u8) !void {
@@ -155,6 +182,6 @@ pub const McpClient = struct {
     }
 };
 
-fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64) anyerror!?Value {
-    return transport.requestInner(self, body, notification, expected_id);
+fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, initialize_request: bool) anyerror!?Value {
+    return transport.requestInner(self, body, notification, expected_id, initialize_request);
 }
