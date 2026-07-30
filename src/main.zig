@@ -52,7 +52,7 @@ fn run(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file.interface;
-    defer out.flush() catch {};
+    defer out.flush() catch |err| std.debug.print("failed to flush stdout: {s}\n", .{@errorName(err)});
 
     if (std.mem.eql(u8, parsed.command, "servers")) {
         if (config.http.len == 0) return out.writeAll("no servers configured.\n");

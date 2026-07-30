@@ -8,6 +8,7 @@ const toml = @import("toml");
 
 const version = "0.1.0";
 const protocol_version = "2025-03-26";
+const max_response_size = 16 * 1024 * 1024;
 
 pub const Server = struct {
     name: []const u8,
@@ -39,6 +40,7 @@ pub const McpClient = struct {
     server: Server,
     session_id: ?[]const u8 = null,
     negotiated_version: []const u8 = protocol_version,
+    supports_tools: bool = false,
     next_id: u64 = 1,
 
     pub fn init(allocator: Allocator, io: Io, server: Server) McpClient {
@@ -49,7 +51,7 @@ pub const McpClient = struct {
         self.http.deinit();
     }
 
-    pub fn connect(self: *McpClient) !void {
+    pub fn connect(self: *McpClient) anyerror!void {
         var params = Value{ .object = .empty };
         try params.object.put(self.allocator, "protocolVersion", .{ .string = protocol_version });
         try params.object.put(self.allocator, "capabilities", .{ .object = .empty });
@@ -58,36 +60,63 @@ pub const McpClient = struct {
         try info.object.put(self.allocator, "version", .{ .string = version });
         try params.object.put(self.allocator, "clientInfo", info);
         const initialized = try self.rpc("initialize", params);
-        self.negotiated_version = getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
+        const negotiated = getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
+        if (!std.mem.eql(u8, negotiated, "2025-03-26") and
+            !std.mem.eql(u8, negotiated, "2024-11-05"))
+            return error.UnsupportedProtocolVersion;
+        self.negotiated_version = negotiated;
+        const capabilities = get(initialized, "capabilities");
+        self.supports_tools = if (capabilities) |c| get(c, "tools") != null else false;
         try self.notifyInitialized();
     }
 
     pub fn request(self: *McpClient, body: []const u8, notification: bool) !?Value {
+        return self.requestExpected(body, notification, null, true);
+    }
+
+    fn requestExpected(
+        self: *McpClient,
+        body: []const u8,
+        notification: bool,
+        expected_id: ?i64,
+        allow_session_recovery: bool,
+    ) anyerror!?Value {
         const Result = union(enum) {
             response: anyerror!?Value,
             timeout: void,
         };
         var completions: [2]Result = undefined;
         var select: Io.Select(Result) = .init(self.io, &completions);
-        try select.concurrent(.response, requestInner, .{ self, body, notification });
+        try select.concurrent(.response, requestInner, .{ self, body, notification, expected_id });
         try select.concurrent(.timeout, waitForTimeout, .{ self.io, self.server.timeoutSecs() });
         const result = try select.await();
         select.cancelDiscard();
         return switch (result) {
-            .response => |response| response,
+            .response => |response| response catch |err| {
+                if (err == error.SessionExpired and allow_session_recovery) {
+                    self.session_id = null;
+                    self.negotiated_version = protocol_version;
+                    self.supports_tools = false;
+                    try self.connect();
+                    return self.requestExpected(body, notification, expected_id, false);
+                }
+                return err;
+            },
             .timeout => {
                 std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, self.server.timeoutSecs() });
+                if (expected_id) |id| self.notifyCancelled(id) catch {};
                 return error.RequestTimedOut;
             },
         };
     }
 
-    fn requestInner(self: *McpClient, body: []const u8, notification: bool) anyerror!?Value {
+    fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64) anyerror!?Value {
         const uri = try std.Uri.parse(self.server.endpoint);
         var extra: std.ArrayList(std.http.Header) = .empty;
         defer extra.deinit(self.allocator);
         try extra.append(self.allocator, .{ .name = "Accept", .value = "application/json, text/event-stream" });
         try extra.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = self.negotiated_version });
+        const sent_session = self.session_id != null;
         if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
         if (self.server.headers) |headers| {
             var it = headers.map.iterator();
@@ -118,34 +147,51 @@ pub const McpClient = struct {
                 break;
             };
         }
+        if (sent_session and status == .not_found) return error.SessionExpired;
         var output: Io.Writer.Allocating = .init(self.allocator);
         defer output.deinit();
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
-        _ = try reader.streamRemaining(&output.writer);
+        while (output.written().len <= max_response_size) {
+            const remaining = max_response_size + 1 - output.written().len;
+            _ = reader.stream(&output.writer, .limited(remaining)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+        }
+        if (output.written().len > max_response_size) return error.ResponseTooLarge;
         const text = output.written();
-        if (status.class() != .success) {
+        // In particular, notification POSTs commonly return 202 Accepted.
+        const accepted_status = status.class() == .success;
+        if (!accepted_status) {
             std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, text });
             return error.HttpRequestFailed;
         }
         if (notification) return null;
         const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
-        if (std.ascii.eqlIgnoreCase(base_type, "application/json")) return try parseRpc(self.allocator, text);
-        if (std.ascii.eqlIgnoreCase(base_type, "text/event-stream")) return try parseSse(self.allocator, text);
+        if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
+            return try parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
+        // Known limitation: the complete SSE body is buffered before events are processed.
+        if (std.ascii.eqlIgnoreCase(base_type, "text/event-stream"))
+            return try parseSse(self, text, expected_id orelse return error.MissingExpectedResponseId);
         std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
         return error.UnsupportedContentType;
     }
 
-    pub fn rpc(self: *McpClient, method: []const u8, params: ?Value) !Value {
+    pub fn rpc(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
+        if ((std.mem.eql(u8, method, "tools/list") or std.mem.eql(u8, method, "tools/call")) and
+            !self.supports_tools)
+            return error.ServerDoesNotSupportTools;
         var request_value = Value{ .object = .empty };
         try request_value.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
-        try request_value.object.put(self.allocator, "id", .{ .integer = @intCast(self.next_id) });
+        const request_id: i64 = @intCast(self.next_id);
+        try request_value.object.put(self.allocator, "id", .{ .integer = request_id });
         try request_value.object.put(self.allocator, "method", .{ .string = method });
         if (params) |p| try request_value.object.put(self.allocator, "params", p);
         self.next_id += 1;
         const body = try jsonString(self.allocator, request_value);
-        return (try self.request(body, false)).?;
+        return (try self.requestExpected(body, false, request_id, true)).?;
     }
 
     fn notifyInitialized(self: *McpClient) !void {
@@ -156,8 +202,34 @@ pub const McpClient = struct {
         _ = try self.request(body, true);
     }
 
+    fn notifyCancelled(self: *McpClient, id: i64) !void {
+        var params = Value{ .object = .empty };
+        try params.object.put(self.allocator, "requestId", .{ .integer = id });
+        var note = Value{ .object = .empty };
+        try note.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
+        try note.object.put(self.allocator, "method", .{ .string = "notifications/cancelled" });
+        try note.object.put(self.allocator, "params", params);
+        const body = try jsonString(self.allocator, note);
+        _ = try self.requestExpected(body, true, null, false);
+    }
+
+    fn respondMethodNotFound(self: *McpClient, id: Value) !void {
+        var rpc_error = Value{ .object = .empty };
+        try rpc_error.object.put(self.allocator, "code", .{ .integer = -32601 });
+        try rpc_error.object.put(self.allocator, "message", .{ .string = "Method not found" });
+        var response = Value{ .object = .empty };
+        try response.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
+        try response.object.put(self.allocator, "id", id);
+        try response.object.put(self.allocator, "error", rpc_error);
+        const body = try jsonString(self.allocator, response);
+        _ = try self.requestExpected(body, true, null, false);
+    }
+
     pub fn listTools(self: *McpClient) ![]const Tool {
+        if (!self.supports_tools) return error.ServerDoesNotSupportTools;
         var tools: std.ArrayList(Tool) = .empty;
+        var seen_cursors: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_cursors.deinit(self.allocator);
         var cursor: ?[]const u8 = null;
         while (true) {
             var params: ?Value = null;
@@ -172,6 +244,8 @@ pub const McpClient = struct {
             for (list.array.items) |tool| try tools.append(self.allocator, .{ .value = tool });
             cursor = getString(result, "nextCursor");
             if (cursor == null or cursor.?.len == 0) break;
+            const entry = try seen_cursors.getOrPut(self.allocator, cursor.?);
+            if (entry.found_existing) return error.RepeatedPaginationCursor;
         }
         return tools.toOwnedSlice(self.allocator);
     }
@@ -185,19 +259,44 @@ fn waitForTimeout(io: Io, seconds: u64) void {
     } }, io) catch {};
 }
 
-fn parseRpc(allocator: Allocator, text: []const u8) !Value {
+fn parseRpc(allocator: Allocator, text: []const u8, expected_id: i64) !Value {
     const rpc = try std.json.parseFromSliceLeaky(Value, allocator, text, .{});
-    if (get(rpc, "error")) |rpc_error| {
-        const code = if (get(rpc_error, "code")) |v| displayScalar(allocator, v) catch "?" else "?";
-        const message = getString(rpc_error, "message") orelse "unknown error";
+    if (rpc == .array) {
+        for (rpc.array.items) |item| {
+            if (responseIdMatches(item, expected_id)) return validateRpcResponse(allocator, item, expected_id);
+        }
+        return error.ResponseIdMismatch;
+    }
+    return validateRpcResponse(allocator, rpc, expected_id);
+}
+
+fn responseIdMatches(rpc: Value, expected_id: i64) bool {
+    const id = get(rpc, "id") orelse return false;
+    return id == .integer and id.integer == expected_id;
+}
+
+fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Value {
+    const jsonrpc = getString(rpc, "jsonrpc") orelse return error.InvalidJsonRpcVersion;
+    if (!std.mem.eql(u8, jsonrpc, "2.0")) return error.InvalidJsonRpcVersion;
+    if (!responseIdMatches(rpc, expected_id)) return error.ResponseIdMismatch;
+    const result = get(rpc, "result");
+    const rpc_error = get(rpc, "error");
+    if ((result == null) == (rpc_error == null)) return error.InvalidJsonRpcResponse;
+    if (rpc_error) |err_value| {
+        const code_value = get(err_value, "code") orelse return error.InvalidJsonRpcError;
+        if (code_value != .integer) return error.InvalidJsonRpcError;
+        const message = getString(err_value, "message") orelse return error.InvalidJsonRpcError;
+        const code = displayScalar(allocator, code_value) catch "?";
         std.debug.print("RPC error [{s}]: {s}\n", .{ code, message });
         return error.JsonRpcError;
     }
-    return get(rpc, "result") orelse error.ResponseMissingResult;
+    return result.?;
 }
 
-fn parseSse(allocator: Allocator, body: []const u8) !Value {
+fn parseSse(self: *McpClient, body: []const u8, expected_id: i64) !Value {
+    const allocator = self.allocator;
     var last: ?Value = null;
+    var last_parse_error: ?anyerror = null;
     var data: Io.Writer.Allocating = .init(allocator);
     defer data.deinit();
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -207,8 +306,16 @@ fn parseSse(allocator: Allocator, body: []const u8) !Value {
         if (line.len == 0) {
             if (data.written().len != 0) {
                 if (std.json.parseFromSliceLeaky(Value, allocator, data.written(), .{})) |rpc| {
-                    if (get(rpc, "result") != null or get(rpc, "error") != null) last = rpc;
-                } else |_| {}
+                    const events = if (rpc == .array) rpc.array.items else &[_]Value{rpc};
+                    for (events) |event| {
+                        if (getString(event, "method") != null) {
+                            if (get(event, "id")) |id| self.respondMethodNotFound(id) catch {};
+                            // Notifications have no id and require no response.
+                        } else if (responseIdMatches(event, expected_id)) {
+                            last = event;
+                        }
+                    }
+                } else |err| last_parse_error = err;
                 data.clearRetainingCapacity();
             }
         } else if (std.mem.startsWith(u8, line, "data:")) {
@@ -217,9 +324,15 @@ fn parseSse(allocator: Allocator, body: []const u8) !Value {
         }
         if (maybe_line == null) break;
     }
-    const rpc = last orelse return error.SseMissingResponse;
+    const rpc = last orelse {
+        if (last_parse_error) |err| {
+            std.debug.print("SSE contained no valid matching response; last JSON parse error: {s}\n", .{@errorName(err)});
+            return err;
+        }
+        return error.SseMissingResponse;
+    };
     const encoded = try jsonString(allocator, rpc);
-    return parseRpc(allocator, encoded);
+    return parseRpc(allocator, encoded, expected_id);
 }
 
 fn get(value: Value, key: []const u8) ?Value {
@@ -245,6 +358,8 @@ fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
 test "SSE returns last response" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const value = try parseSse(arena.allocator(), "data: nope\n\ndata: {\"result\":{\"page\":1}}\n\ndata: {\"result\":{\"page\":2}}\n\n");
+    var client = McpClient.init(arena.allocator(), std.testing.io, .{ .name = "test", .endpoint = "http://example.test" });
+    defer client.deinit();
+    const value = try parseSse(&client, "data: nope\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":2}}\n\n", 1);
     try std.testing.expectEqual(@as(i64, 2), get(value, "page").?.integer);
 }
