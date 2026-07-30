@@ -84,14 +84,15 @@ The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, 
 
 ## Protocol Behavior and Limits
 
+- `McpClient.init` requires an arena or process-scoped allocator that outlives the client. Individual client allocations are intentionally not freed; a general-purpose allocator is not supported for repeated client reuse.
 - mcpx proposes and accepts only MCP protocol version `2025-03-26`; other versions produce `UnsupportedProtocolVersion`.
 - Before `tools/list` or `tools/call`, mcpx checks the initialized server's `capabilities.tools`; absence produces `ServerDoesNotSupportTools`.
 - One stateful MCP session is initialized per invocation. `Mcp-Session-Id` is accepted only from the `initialize` response, must contain visible ASCII characters only, and is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
-- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request using a separate fixed 5-second timeout, except initialization requests, which MCP prohibits cancelling. Cancellation therefore adds at most 5 seconds. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
+- The configured timeout covers the entire request, including URI resolution, DNS, connection establishment, TLS, and response-body reading. Those stages produce their own errors only when they fail before the timer fires. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request using a separate fixed 5-second timeout, except initialization requests, which MCP prohibits cancelling. Cancellation therefore adds at most 5 seconds.
 - Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
-- SSE events are parsed incrementally and a matching numeric JSON-RPC response is returned as soon as it arrives. Valid JSON-RPC 2.0 events containing `method` are collected as server requests (with an `id`) or notifications (without one); after the matching response arrives, `ping` requests receive an empty successful result and other server requests receive method-not-found.
+- SSE events are parsed incrementally. Every message in a JSON-RPC batch is inspected before a matching numeric response is returned. Valid JSON-RPC 2.0 server requests are answered immediately during stream consumption using a separate HTTP POST: `ping` receives an empty successful result and unknown methods receive method-not-found. Notifications are inspected but require no response.
 - Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning.
-- All `tools/list` pages are fetched automatically. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
+- Up to 1,000 `tools/list` pages and 100,000 tools are fetched automatically; exceeding either aggregate limit produces `PaginationLimitExceeded`. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
 ## Exit Codes and Errors
 
@@ -116,6 +117,7 @@ Success exits `0`; any error exits `1`. Every error prints a final `error: Error
 | `request to URL timed out after N seconds` then `RequestTimedOut` | The explicit request timer expired |
 | `ResponseTooLarge` | Response body exceeded 16 MiB |
 | `RepeatedPaginationCursor` | A tools-list cursor repeated |
+| `PaginationLimitExceeded` | Tool pagination exceeded 1,000 pages or 100,000 tools |
 | `UnsupportedProtocolVersion` | Server negotiated neither supported MCP version |
 | `HTTP NNN reason: body` then `HttpRequestFailed` | Server returned a non-2xx response |
 | `RPC error [code]: message` then `JsonRpcError` | Server returned a JSON-RPC error |

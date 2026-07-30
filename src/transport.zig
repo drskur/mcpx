@@ -58,10 +58,6 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
     if (status.class() == .success and !notification and std.ascii.eqlIgnoreCase(base_type, "text/event-stream")) {
         const result = try rpc.parseSseReader(self, reader, expected_id orelse return error.MissingExpectedResponseId);
-        for (result.pending_server_requests) |pending| {
-            self.respondServerRequest(pending.id, pending.method) catch |err|
-                std.debug.print("failed to respond to server request '{s}': {s}\n", .{ pending.method, @errorName(err) });
-        }
         return result.response;
     }
 

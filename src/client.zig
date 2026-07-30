@@ -10,6 +10,8 @@ const transport = @import("transport.zig");
 
 const version = "0.1.0";
 const protocol_version = "2025-03-26";
+const max_pagination_pages: usize = 1000;
+const max_pagination_tools: usize = 100_000;
 
 pub const Server = struct {
     name: []const u8,
@@ -45,6 +47,8 @@ pub const McpClient = struct {
     next_id: u64 = 1,
     test_server_responses: ?*std.ArrayList([]u8) = null,
 
+    /// `allocator` MUST be an arena or process-scoped allocator that outlives
+    /// the client. Individual allocations are intentionally not freed.
     pub fn init(allocator: Allocator, io: Io, server: Server) McpClient {
         return .{ .allocator = allocator, .io = io, .http = .{ .allocator = allocator, .io = io }, .server = server };
     }
@@ -62,15 +66,9 @@ pub const McpClient = struct {
         try info.object.put(self.allocator, "version", .{ .string = version });
         try params.object.put(self.allocator, "clientInfo", info);
         const initialized = try self.rpc("initialize", params);
-        const negotiated = rpc_module.getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
-        if (!std.mem.eql(u8, negotiated, protocol_version)) return error.UnsupportedProtocolVersion;
-        self.negotiated_version = negotiated;
-        const capabilities = rpc_module.get(initialized, "capabilities") orelse return error.InitializeMissingCapabilities;
-        if (capabilities != .object) return error.InitializeCapabilitiesMustBeObject;
-        const server_info = rpc_module.get(initialized, "serverInfo") orelse return error.InitializeMissingServerInfo;
-        if (server_info != .object) return error.InitializeServerInfoMustBeObject;
-        _ = rpc_module.getString(server_info, "name") orelse return error.InitializeServerInfoMissingName;
-        self.supports_tools = rpc_module.get(capabilities, "tools") != null;
+        const initialization = try validateInitialization(initialized);
+        self.negotiated_version = initialization.negotiated_version;
+        self.supports_tools = initialization.supports_tools;
         try self.notifyInitialized();
     }
 
@@ -162,7 +160,10 @@ pub const McpClient = struct {
         var seen_cursors: std.StringHashMapUnmanaged(void) = .empty;
         defer seen_cursors.deinit(self.allocator);
         var cursor: ?[]const u8 = null;
+        var page_count: usize = 0;
         while (true) {
+            try enforcePaginationLimits(page_count, tools.items.len, 0);
+            page_count += 1;
             var params: ?Value = null;
             if (cursor) |c| {
                 var object = Value{ .object = .empty };
@@ -172,6 +173,7 @@ pub const McpClient = struct {
             const result = try self.rpc("tools/list", params);
             const list = rpc_module.get(result, "tools") orelse return error.ToolsListMissingTools;
             if (list != .array) return error.ToolsListMissingTools;
+            try enforcePaginationLimits(page_count - 1, tools.items.len, list.array.items.len);
             for (list.array.items) |tool| try tools.append(self.allocator, .{ .value = tool });
             cursor = rpc_module.getString(result, "nextCursor");
             if (cursor == null or cursor.?.len == 0) break;
@@ -182,6 +184,49 @@ pub const McpClient = struct {
     }
 };
 
+const Initialization = struct {
+    negotiated_version: []const u8,
+    supports_tools: bool,
+};
+
+fn validateInitialization(initialized: Value) !Initialization {
+    const negotiated = rpc_module.getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
+    if (!std.mem.eql(u8, negotiated, protocol_version)) return error.UnsupportedProtocolVersion;
+    const capabilities = rpc_module.get(initialized, "capabilities") orelse return error.InitializeMissingCapabilities;
+    if (capabilities != .object) return error.InitializeCapabilitiesMustBeObject;
+    const server_info = rpc_module.get(initialized, "serverInfo") orelse return error.InitializeMissingServerInfo;
+    if (server_info != .object) return error.InitializeServerInfoMustBeObject;
+    _ = rpc_module.getString(server_info, "name") orelse return error.InitializeServerInfoMissingName;
+    _ = rpc_module.getString(server_info, "version") orelse return error.InitializeServerInfoMissingVersion;
+    const tools = rpc_module.get(capabilities, "tools");
+    if (tools) |value| if (value != .object) return error.InitializeToolsCapabilityMustBeObject;
+    return .{ .negotiated_version = negotiated, .supports_tools = tools != null };
+}
+
+fn enforcePaginationLimits(page_count: usize, total_tools: usize, additional_tools: usize) !void {
+    if (page_count >= max_pagination_pages) return error.PaginationLimitExceeded;
+    if (additional_tools > max_pagination_tools -| total_tools) return error.PaginationLimitExceeded;
+}
+
 fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, initialize_request: bool) anyerror!?Value {
     return transport.requestInner(self, body, notification, expected_id, initialize_request);
+}
+
+test "initialization requires serverInfo version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const initialized = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"serverInfo\":{\"name\":\"server\"}}", .{});
+    try std.testing.expectError(error.InitializeServerInfoMissingVersion, validateInitialization(initialized));
+}
+
+test "initialization requires tools capability to be an object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const initialized = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":\"yes\"},\"serverInfo\":{\"name\":\"server\",\"version\":\"1\"}}", .{});
+    try std.testing.expectError(error.InitializeToolsCapabilityMustBeObject, validateInitialization(initialized));
+}
+
+test "pagination aggregate limits are enforced" {
+    try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(max_pagination_pages, 0, 0));
+    try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(1, max_pagination_tools, 1));
 }
