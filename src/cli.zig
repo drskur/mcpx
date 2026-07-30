@@ -41,7 +41,7 @@ pub fn parseArgs(args: []const []const u8) !ParsedArgs {
         .positionals_len = 0,
         .help = true,
     };
-    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
+    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "auth")) 1 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
     if (count < needed) return error.MissingArgument;
     return .{ .config = config, .command = cmd, .positionals = positions, .positionals_len = count };
 }
@@ -56,6 +56,7 @@ pub fn writeUsage(io: Io) !void {
         \\
         \\Commands:
         \\  servers
+        \\  auth <server>
         \\  list <server>
         \\  call <server> <tool> [json_args]
         \\  skills <server> [tool]
@@ -92,4 +93,10 @@ test "argument parser accepts config after positionals" {
     const parsed = try parseArgs(&.{ "mcpx", "call", "demo", "tool", "-c", "late.toml" });
     try std.testing.expectEqualStrings("late.toml", parsed.config.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.positionals_len);
+}
+
+test "argument parser accepts auth command" {
+    const parsed = try parseArgs(&.{ "mcpx", "auth", "demo" });
+    try std.testing.expectEqualStrings("auth", parsed.command);
+    try std.testing.expectEqualStrings("demo", parsed.positionals[0]);
 }

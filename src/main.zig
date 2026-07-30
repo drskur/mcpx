@@ -9,6 +9,7 @@ const version = "0.1.0";
 const toml = @import("toml");
 const client_module = @import("client.zig");
 const cli = @import("cli.zig");
+const oauth = @import("oauth.zig");
 const skills = @import("skills.zig");
 const McpClient = client_module.McpClient;
 const Server = client_module.Server;
@@ -49,10 +50,12 @@ fn run(init: std.process.Init) !void {
     };
     defer parsed_config.deinit();
     const config = parsed_config.value;
+    const home = init.minimal.environ.getAlloc(allocator, "HOME") catch return error.HomeNotSet;
+    const token_path = try std.fs.path.join(allocator, &.{ home, ".config/mcpx/tokens.toml" });
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file.interface;
-    const command_result = runCommand(allocator, init.io, parsed, config, out);
+    const command_result = runCommand(allocator, init.io, parsed, config, token_path, out);
     out.flush() catch |err| {
         std.debug.print("failed to flush stdout: {s}\n", .{@errorName(err)});
         return err;
@@ -60,10 +63,10 @@ fn run(init: std.process.Init) !void {
     return command_result;
 }
 
-fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Config, out: *Io.Writer) !void {
+fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Config, token_path: []const u8, out: *Io.Writer) !void {
     if (std.mem.eql(u8, parsed.command, "servers")) {
         if (config.http.len == 0) return out.writeAll("no servers configured.\n");
-        for (config.http) |s| try out.print("{s}\t{s}\n", .{ s.name, s.endpoint });
+        for (config.http) |s| try out.print("{s}\t{s}{s}\n", .{ s.name, s.endpoint, if (s.oauth != null) " [oauth]" else "" });
         return;
     }
     const server_name = parsed.positionals[0];
@@ -71,8 +74,13 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
         try printMissingServer(config, server_name);
         return error.ServerNotFound;
     };
-    var client = McpClient.init(allocator, io, server);
+    var client = McpClient.init(allocator, io, server, token_path);
     defer client.deinit();
+    if (std.mem.eql(u8, parsed.command, "auth")) {
+        try client.authenticate();
+        try out.print("authenticated {s}\n", .{server.name});
+        return;
+    }
     try client.connect();
 
     if (std.mem.eql(u8, parsed.command, "call")) {
@@ -142,6 +150,10 @@ test "config parses servers via toml library" {
         \\name = "two"
         \\endpoint = "https://example.test/mcp"
         \\timeout_secs = 60
+        \\[http.oauth]
+        \\client_id = "client"
+        \\scopes = "read write"
+        \\register = false
         \\
     );
     defer parsed_config.deinit();
@@ -149,6 +161,8 @@ test "config parses servers via toml library" {
     try std.testing.expectEqual(@as(usize, 2), config.http.len);
     try std.testing.expectEqual(@as(u64, 30), config.http[0].timeoutSecs());
     try std.testing.expectEqual(@as(u64, 60), config.http[1].timeoutSecs());
+    try std.testing.expectEqualStrings("client", config.http[1].oauth.?.client_id.?);
+    try std.testing.expectEqualStrings("read write", config.http[1].oauth.?.scopes.?);
     const headers = config.http[0].headers.?;
     try std.testing.expectEqualStrings("a,b", headers.map.get("X-Label").?);
 }
@@ -157,4 +171,5 @@ test {
     std.testing.refAllDecls(cli);
     std.testing.refAllDecls(client_module);
     std.testing.refAllDecls(skills);
+    std.testing.refAllDecls(oauth);
 }

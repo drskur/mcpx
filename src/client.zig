@@ -7,6 +7,7 @@ const Value = std.json.Value;
 const toml = @import("toml");
 const rpc_module = @import("rpc.zig");
 const transport = @import("transport.zig");
+const oauth_module = @import("oauth.zig");
 
 const version = "0.1.0";
 const protocol_version = "2025-03-26";
@@ -18,6 +19,7 @@ pub const Server = struct {
     endpoint: []const u8,
     headers: ?toml.HashMap([]const u8) = null,
     timeout_secs: ?u64 = null,
+    oauth: ?oauth_module.OauthConfig = null,
 
     pub fn timeoutSecs(self: Server) u64 {
         return self.timeout_secs orelse 30;
@@ -46,11 +48,20 @@ pub const McpClient = struct {
     supports_tools: bool = false,
     next_id: u64 = 1,
     test_server_responses: ?*std.ArrayList([]u8) = null,
+    token_path: []const u8,
+    authorization_header: ?[]const u8 = null,
+    oauth_recovery_in_progress: bool = false,
 
     /// `allocator` MUST be an arena or process-scoped allocator that outlives
     /// the client. Individual allocations are intentionally not freed.
-    pub fn init(allocator: Allocator, io: Io, server: Server) McpClient {
-        return .{ .allocator = allocator, .io = io, .http = .{ .allocator = allocator, .io = io }, .server = server };
+    pub fn init(allocator: Allocator, io: Io, server: Server, token_path: []const u8) McpClient {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .http = .{ .allocator = allocator, .io = io },
+            .server = server,
+            .token_path = token_path,
+        };
     }
 
     pub fn deinit(self: *McpClient) void {
@@ -90,6 +101,18 @@ pub const McpClient = struct {
         initialize_request: bool,
         timeout_secs: u64,
     ) anyerror!?Value {
+        if (self.server.oauth) |oauth_config| if (self.authorization_header == null) {
+            const token = try oauth_module.ensureToken(
+                self.allocator,
+                self.io,
+                &self.http,
+                self.server.name,
+                self.server.endpoint,
+                oauth_config,
+                self.token_path,
+            );
+            try self.setAuthorization(token);
+        };
         const Result = union(enum) { response: anyerror!?Value, timeout: void };
         var completions: [2]Result = undefined;
         var select: Io.Select(Result) = .init(self.io, &completions);
@@ -99,6 +122,21 @@ pub const McpClient = struct {
         select.cancelDiscard();
         return switch (result) {
             .response => |response| response catch |err| {
+                if (err == error.HttpUnauthorized and self.server.oauth != null and !self.oauth_recovery_in_progress) {
+                    self.oauth_recovery_in_progress = true;
+                    defer self.oauth_recovery_in_progress = false;
+                    const token = try oauth_module.recoverUnauthorized(
+                        self.allocator,
+                        self.io,
+                        &self.http,
+                        self.server.name,
+                        self.server.endpoint,
+                        self.server.oauth.?,
+                        self.token_path,
+                    );
+                    try self.setAuthorization(token);
+                    return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, initialize_request, timeout_secs);
+                }
                 if (err == error.SessionExpired and allow_session_recovery) {
                     self.session_id = null;
                     self.negotiated_version = protocol_version;
@@ -115,6 +153,24 @@ pub const McpClient = struct {
                 return error.RequestTimedOut;
             },
         };
+    }
+
+    pub fn authenticate(self: *McpClient) !void {
+        const config = self.server.oauth orelse return error.OauthNotConfigured;
+        const token = try oauth_module.forceAuthenticate(
+            self.allocator,
+            self.io,
+            &self.http,
+            self.server.name,
+            self.server.endpoint,
+            config,
+            self.token_path,
+        );
+        try self.setAuthorization(token);
+    }
+
+    fn setAuthorization(self: *McpClient, token: oauth_module.Token) !void {
+        self.authorization_header = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ token.token_type, token.access_token });
     }
 
     pub fn rpc(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {

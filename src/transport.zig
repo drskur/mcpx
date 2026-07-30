@@ -14,10 +14,12 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     try extra.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = self.negotiated_version });
     const sent_session = self.session_id != null;
     if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
+    if (self.authorization_header) |authorization|
+        try extra.append(self.allocator, .{ .name = "Authorization", .value = authorization });
     if (self.server.headers) |headers| {
         var it = headers.map.iterator();
         while (it.next()) |entry| {
-            if (isReservedHeader(entry.key_ptr.*)) {
+            if (isReservedHeader(entry.key_ptr.*, self.server.oauth != null)) {
                 std.debug.print("warning: skipping reserved configured header '{s}'\n", .{entry.key_ptr.*});
                 continue;
             }
@@ -79,7 +81,7 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
             std.debug.print("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
         else
             std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
-        return error.HttpRequestFailed;
+        return if (status == .unauthorized) error.HttpUnauthorized else error.HttpRequestFailed;
     }
     if (notification) return null;
     if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
@@ -135,7 +137,8 @@ fn sendServerResponse(self: anytype, response: Value) !void {
     _ = try self.requestExpected(body, true, null, false, false);
 }
 
-fn isReservedHeader(name: []const u8) bool {
+fn isReservedHeader(name: []const u8, oauth_active: bool) bool {
+    if (oauth_active and std.ascii.eqlIgnoreCase(name, "authorization")) return true;
     const reserved = [_][]const u8{
         "accept",
         "content-type",
@@ -163,17 +166,18 @@ fn isValidSessionId(value: []const u8) bool {
 }
 
 test "reserved headers include framing and hop-by-hop headers" {
-    try std.testing.expect(isReservedHeader("Content-Length"));
-    try std.testing.expect(isReservedHeader("transfer-encoding"));
-    try std.testing.expect(isReservedHeader("HOST"));
-    try std.testing.expect(isReservedHeader("connection"));
-    try std.testing.expect(isReservedHeader("keep-alive"));
-    try std.testing.expect(isReservedHeader("upgrade"));
-    try std.testing.expect(isReservedHeader("proxy-authorization"));
-    try std.testing.expect(isReservedHeader("proxy-connection"));
-    try std.testing.expect(isReservedHeader("te"));
-    try std.testing.expect(isReservedHeader("trailer"));
-    try std.testing.expect(!isReservedHeader("authorization"));
+    try std.testing.expect(isReservedHeader("Content-Length", false));
+    try std.testing.expect(isReservedHeader("transfer-encoding", false));
+    try std.testing.expect(isReservedHeader("HOST", false));
+    try std.testing.expect(isReservedHeader("connection", false));
+    try std.testing.expect(isReservedHeader("keep-alive", false));
+    try std.testing.expect(isReservedHeader("upgrade", false));
+    try std.testing.expect(isReservedHeader("proxy-authorization", false));
+    try std.testing.expect(isReservedHeader("proxy-connection", false));
+    try std.testing.expect(isReservedHeader("te", false));
+    try std.testing.expect(isReservedHeader("trailer", false));
+    try std.testing.expect(!isReservedHeader("authorization", false));
+    try std.testing.expect(isReservedHeader("Authorization", true));
 }
 
 test "session IDs contain visible ASCII only" {

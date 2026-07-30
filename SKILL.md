@@ -18,11 +18,29 @@ endpoint = "https://mcp.example.com/mcp"
 timeout_secs = 60          # optional, default 30
 
 [http.headers]
-Authorization = "Bearer ***"
 X-Custom = "value"
+
+[http.oauth]
+client_id = "my-app"          # optional when register = true
+scopes = "repo read"          # optional, space-separated
+register = true               # optional RFC 7591 dynamic registration
 ```
 
 Multiple `[[http]]` blocks register multiple servers. `-c` and `--config` are global flags and work anywhere in the argument list, including after the command or its positionals.
+
+OAuth-enabled servers use the MCP 2025-03-26 Authorization Code + PKCE flow.
+mcpx discovers protected-resource and authorization-server metadata, generates
+an S256 PKCE challenge and CSRF state, opens the authorization URL with
+`xdg-open` on Linux, and accepts one redirect on an ephemeral
+`127.0.0.1` port. The URL is printed to stderr as a manual fallback. Dynamic
+registration uses RFC 7591 when `register = true`; a configured `client_id`, or
+a previously persisted dynamically registered client, is reused.
+
+OAuth tokens and client credentials are kept out of the main config in
+`~/.config/mcpx/tokens.toml`. Grants and refreshes atomically replace this file
+with `0600` owner-only permissions. mcpx refreshes an access token when it is
+expired or within 60 seconds of expiry. On HTTP 401 it performs at most one
+refresh-or-authorization recovery and retries the request once.
 
 ## Usage and Commands
 
@@ -32,6 +50,7 @@ Running `mcpx` with no arguments, or with `-h` / `--help`, prints usage and exit
 mcpx [-c PATH] <COMMAND>
 
 mcpx servers
+mcpx auth <server>
 mcpx list <server>
 mcpx call <server> <tool> [json_args]
 mcpx skills <server> [tool]
@@ -45,7 +64,18 @@ The parser accepts at most three positional arguments after the command. Command
 mcpx servers
 ```
 
-Output is `name\tendpoint` per line. If the config contains no servers, output is `no servers configured.`
+Output is `name\tendpoint` per line, with ` [oauth]` appended to OAuth-enabled
+servers. If the config contains no servers, output is `no servers configured.`
+
+### Force OAuth authentication
+
+```bash
+mcpx auth <server>
+```
+
+The server must contain an `[http.oauth]` block. This runs a fresh browser and
+localhost callback flow, stores the resulting token, and prints
+`authenticated <server>` on success.
 
 ### List tools on a server
 
@@ -91,7 +121,7 @@ The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, 
 - The configured timeout covers the entire request, including URI resolution, DNS, connection establishment, TLS, and response-body reading. Those stages produce their own errors only when they fail before the timer fires. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request using a separate fixed 5-second timeout, except initialization requests, which MCP prohibits cancelling. Cancellation therefore adds at most 5 seconds.
 - Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
 - SSE events are parsed incrementally. Every message in a JSON-RPC batch is inspected before a matching numeric response is returned. Valid JSON-RPC 2.0 server requests are answered immediately during stream consumption using a separate HTTP POST: `ping` receives an empty successful result and unknown methods receive method-not-found. Notifications are inspected but require no response.
-- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning.
+- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning. `Authorization` is additionally reserved and managed by mcpx when the server has an OAuth block. Without OAuth, a static configured `Authorization` header is still allowed.
 - Up to 1,000 `tools/list` pages and 100,000 tools are fetched automatically; exceeding either aggregate limit produces `PaginationLimitExceeded`. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
 ## Exit Codes and Errors
@@ -102,6 +132,7 @@ Success exits `0`; any error exits `1`. Every error prints a final `error: Error
 |---|---|
 | `MissingCommand` | No longer emitted: no arguments prints usage and exits `0` |
 | `UnknownCommand` | Command name is not recognized |
+| `OauthNotConfigured` | `mcpx auth` targeted a server without an OAuth block |
 | `MissingArgument` | Command lacks a required server or tool positional |
 | `MissingConfigPath` | `-c` / `--config` has no following path |
 | `TooManyArguments` | More than three positional arguments follow the command |
