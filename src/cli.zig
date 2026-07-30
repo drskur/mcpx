@@ -75,3 +75,21 @@ test "argument parser treats no arguments as help" {
     const parsed = try parseArgs(&.{"mcpx"});
     try std.testing.expect(parsed.help);
 }
+
+test "argument parser rejects unknown command" {
+    try std.testing.expectError(error.UnknownCommand, parseArgs(&.{ "mcpx", "wat" }));
+}
+
+test "argument parser rejects missing argument" {
+    try std.testing.expectError(error.MissingArgument, parseArgs(&.{ "mcpx", "call", "demo" }));
+}
+
+test "argument parser rejects too many arguments" {
+    try std.testing.expectError(error.TooManyArguments, parseArgs(&.{ "mcpx", "call", "demo", "tool", "{}", "extra" }));
+}
+
+test "argument parser accepts config after positionals" {
+    const parsed = try parseArgs(&.{ "mcpx", "call", "demo", "tool", "-c", "late.toml" });
+    try std.testing.expectEqualStrings("late.toml", parsed.config.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.positionals_len);
+}

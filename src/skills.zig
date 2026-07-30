@@ -104,3 +104,46 @@ fn jsonString(allocator: Allocator, value: Value) ![]u8 {
 fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
     return if (value == .string) value.string else jsonString(allocator, value);
 }
+
+fn parseTestJson(allocator: Allocator, text: []const u8) !Value {
+    return std.json.parseFromSliceLeaky(Value, allocator, text, .{});
+}
+
+fn renderTestTool(allocator: Allocator) ![]const u8 {
+    const value = try parseTestJson(allocator,
+        \\{"name":"search","inputSchema":{"type":"object","properties":{"kind":{"type":"string","enum":["a","b"]}},"required":["kind"]}}
+    );
+    var output: Io.Writer.Allocating = .init(allocator);
+    try renderTool(&output.writer, allocator, .{ .value = value });
+    return output.toOwnedSlice();
+}
+
+test "renderTool produces markdown with heading" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const output = try renderTestTool(arena.allocator());
+    try std.testing.expect(std.mem.startsWith(u8, output, "## search\n"));
+}
+
+test "renderTool shows required flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const output = try renderTestTool(arena.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, output, "**(required)**") != null);
+}
+
+test "renderTool shows enum constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const output = try renderTestTool(arena.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, output, "enum: a | b") != null);
+}
+
+test "prettyPrint produces indented JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseTestJson(arena.allocator(), "{\"outer\":{\"value\":1}}");
+    var output: Io.Writer.Allocating = .init(arena.allocator());
+    try prettyPrint(&output.writer, value);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\n  \"outer\": {\n    \"value\": 1\n") != null);
+}

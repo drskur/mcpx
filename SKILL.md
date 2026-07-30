@@ -84,12 +84,13 @@ The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, 
 
 ## Protocol Behavior and Limits
 
-- mcpx proposes MCP protocol version `2025-03-26` and accepts negotiated versions `2025-03-26` and `2024-11-05`; other versions produce `UnsupportedProtocolVersion`.
+- mcpx proposes and accepts only MCP protocol version `2025-03-26`; other versions produce `UnsupportedProtocolVersion`.
 - Before `tools/list` or `tools/call`, mcpx checks the initialized server's `capabilities.tools`; absence produces `ServerDoesNotSupportTools`.
 - One stateful MCP session is initialized per invocation. The first `Mcp-Session-Id` is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
-- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
+- The configured timeout is an explicit timer. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request, except initialization requests, which MCP prohibits cancelling. DNS, TLS, connection, and other transport failures are separate errors, not timeouts.
 - Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
-- SSE response bodies are fully buffered before parsing. Responses are matched to the numeric JSON-RPC request ID, not selected merely because they are the last event with `result` or `error`. Events containing `method` are treated as server requests (with an `id`) or notifications (without one); server requests receive a method-not-found response.
+- SSE events are parsed incrementally and a matching numeric JSON-RPC response is returned as soon as it arrives. Events containing `method` are handled inline as server requests (with an `id`) or notifications (without one); `ping` requests receive an empty successful result and other server requests receive method-not-found.
+- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, or `Mcp-Session-Id`; matching names are skipped case-insensitively with a warning.
 - All `tools/list` pages are fetched automatically. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
 ## Exit Codes and Errors

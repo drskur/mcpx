@@ -42,6 +42,7 @@ pub const McpClient = struct {
     negotiated_version: []const u8 = protocol_version,
     supports_tools: bool = false,
     next_id: u64 = 1,
+    test_server_responses: ?*std.ArrayList([]u8) = null,
 
     pub fn init(allocator: Allocator, io: Io, server: Server) McpClient {
         return .{ .allocator = allocator, .io = io, .http = .{ .allocator = allocator, .io = io }, .server = server };
@@ -61,9 +62,7 @@ pub const McpClient = struct {
         try params.object.put(self.allocator, "clientInfo", info);
         const initialized = try self.rpc("initialize", params);
         const negotiated = getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
-        if (!std.mem.eql(u8, negotiated, "2025-03-26") and
-            !std.mem.eql(u8, negotiated, "2024-11-05"))
-            return error.UnsupportedProtocolVersion;
+        if (!std.mem.eql(u8, negotiated, protocol_version)) return error.UnsupportedProtocolVersion;
         self.negotiated_version = negotiated;
         const capabilities = get(initialized, "capabilities");
         self.supports_tools = if (capabilities) |c| get(c, "tools") != null else false;
@@ -71,7 +70,7 @@ pub const McpClient = struct {
     }
 
     pub fn request(self: *McpClient, body: []const u8, notification: bool) !?Value {
-        return self.requestExpected(body, notification, null, true);
+        return self.requestExpected(body, notification, null, true, false);
     }
 
     fn requestExpected(
@@ -80,6 +79,7 @@ pub const McpClient = struct {
         notification: bool,
         expected_id: ?i64,
         allow_session_recovery: bool,
+        cancellable: bool,
     ) anyerror!?Value {
         const Result = union(enum) {
             response: anyerror!?Value,
@@ -98,13 +98,13 @@ pub const McpClient = struct {
                     self.negotiated_version = protocol_version;
                     self.supports_tools = false;
                     try self.connect();
-                    return self.requestExpected(body, notification, expected_id, false);
+                    return self.requestExpected(body, notification, expected_id, false, cancellable);
                 }
                 return err;
             },
             .timeout => {
                 std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, self.server.timeoutSecs() });
-                if (expected_id) |id| self.notifyCancelled(id) catch {};
+                if (cancellable) if (expected_id) |id| self.notifyCancelled(id) catch {};
                 return error.RequestTimedOut;
             },
         };
@@ -120,7 +120,13 @@ pub const McpClient = struct {
         if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
         if (self.server.headers) |headers| {
             var it = headers.map.iterator();
-            while (it.next()) |entry| try extra.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+            while (it.next()) |entry| {
+                if (isReservedHeader(entry.key_ptr.*)) {
+                    std.debug.print("warning: skipping reserved configured header '{s}'\n", .{entry.key_ptr.*});
+                    continue;
+                }
+                try extra.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+            }
         }
 
         var req = try self.http.request(.POST, uri, .{
@@ -148,11 +154,15 @@ pub const McpClient = struct {
             };
         }
         if (sent_session and status == .not_found) return error.SessionExpired;
-        var output: Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+        const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
+        if (status.class() == .success and !notification and std.ascii.eqlIgnoreCase(base_type, "text/event-stream"))
+            return try parseSseReader(self, reader, expected_id orelse return error.MissingExpectedResponseId);
+
+        var output: Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
         while (output.written().len <= max_response_size) {
             const remaining = max_response_size + 1 - output.written().len;
             _ = reader.stream(&output.writer, .limited(remaining)) catch |err| switch (err) {
@@ -169,12 +179,8 @@ pub const McpClient = struct {
             return error.HttpRequestFailed;
         }
         if (notification) return null;
-        const base_type = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
         if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
             return try parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
-        // Known limitation: the complete SSE body is buffered before events are processed.
-        if (std.ascii.eqlIgnoreCase(base_type, "text/event-stream"))
-            return try parseSse(self, text, expected_id orelse return error.MissingExpectedResponseId);
         std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
         return error.UnsupportedContentType;
     }
@@ -191,7 +197,7 @@ pub const McpClient = struct {
         if (params) |p| try request_value.object.put(self.allocator, "params", p);
         self.next_id += 1;
         const body = try jsonString(self.allocator, request_value);
-        return (try self.requestExpected(body, false, request_id, true)).?;
+        return (try self.requestExpected(body, false, request_id, true, !std.mem.eql(u8, method, "initialize"))).?;
     }
 
     fn notifyInitialized(self: *McpClient) !void {
@@ -210,19 +216,27 @@ pub const McpClient = struct {
         try note.object.put(self.allocator, "method", .{ .string = "notifications/cancelled" });
         try note.object.put(self.allocator, "params", params);
         const body = try jsonString(self.allocator, note);
-        _ = try self.requestExpected(body, true, null, false);
+        _ = try self.requestExpected(body, true, null, false, false);
     }
 
-    fn respondMethodNotFound(self: *McpClient, id: Value) !void {
-        var rpc_error = Value{ .object = .empty };
-        try rpc_error.object.put(self.allocator, "code", .{ .integer = -32601 });
-        try rpc_error.object.put(self.allocator, "message", .{ .string = "Method not found" });
+    fn respondServerRequest(self: *McpClient, id: Value, method: []const u8) !void {
         var response = Value{ .object = .empty };
         try response.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
         try response.object.put(self.allocator, "id", id);
-        try response.object.put(self.allocator, "error", rpc_error);
+        if (std.mem.eql(u8, method, "ping")) {
+            try response.object.put(self.allocator, "result", .{ .object = .empty });
+        } else {
+            var rpc_error = Value{ .object = .empty };
+            try rpc_error.object.put(self.allocator, "code", .{ .integer = -32601 });
+            try rpc_error.object.put(self.allocator, "message", .{ .string = "Method not found" });
+            try response.object.put(self.allocator, "error", rpc_error);
+        }
         const body = try jsonString(self.allocator, response);
-        _ = try self.requestExpected(body, true, null, false);
+        if (self.test_server_responses) |responses| {
+            try responses.append(self.allocator, body);
+            return;
+        }
+        _ = try self.requestExpected(body, true, null, false, false);
     }
 
     pub fn listTools(self: *McpClient) ![]const Tool {
@@ -294,45 +308,85 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
 }
 
 fn parseSse(self: *McpClient, body: []const u8, expected_id: i64) !Value {
+    var reader = Io.Reader.fixed(body);
+    return parseSseReader(self, &reader, expected_id);
+}
+
+fn parseSseReader(self: *McpClient, reader: *Io.Reader, expected_id: i64) !Value {
     const allocator = self.allocator;
-    var last: ?Value = null;
     var last_parse_error: ?anyerror = null;
     var data: Io.Writer.Allocating = .init(allocator);
     defer data.deinit();
-    var lines = std.mem.splitScalar(u8, body, '\n');
+    var line: Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    var accumulated: usize = 0;
     while (true) {
-        const maybe_line = lines.next();
-        const line = if (maybe_line) |l| std.mem.trimEnd(u8, l, "\r") else "";
-        if (line.len == 0) {
+        line.clearRetainingCapacity();
+        const remaining = max_response_size + 1 - accumulated;
+        const line_len = reader.streamDelimiterLimit(&line.writer, '\n', .limited(remaining)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ResponseTooLarge,
+            else => return err,
+        };
+        accumulated = std.math.add(usize, accumulated, line_len) catch return error.ResponseTooLarge;
+        if (accumulated > max_response_size) return error.ResponseTooLarge;
+        const end_of_stream = blk: {
+            const delimiter = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break :blk true,
+                else => return err,
+            };
+            std.debug.assert(delimiter == '\n');
+            break :blk false;
+        };
+        if (!end_of_stream) {
+            accumulated = std.math.add(usize, accumulated, 1) catch return error.ResponseTooLarge;
+            if (accumulated > max_response_size) return error.ResponseTooLarge;
+        }
+        const text = std.mem.trimEnd(u8, line.written(), "\r");
+        if (text.len == 0) {
             if (data.written().len != 0) {
-                if (std.json.parseFromSliceLeaky(Value, allocator, data.written(), .{})) |rpc| {
-                    const events = if (rpc == .array) rpc.array.items else &[_]Value{rpc};
-                    for (events) |event| {
-                        if (getString(event, "method") != null) {
-                            if (get(event, "id")) |id| self.respondMethodNotFound(id) catch {};
-                            // Notifications have no id and require no response.
-                        } else if (responseIdMatches(event, expected_id)) {
-                            last = event;
-                        }
-                    }
-                } else |err| last_parse_error = err;
+                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error)) |result| return result;
                 data.clearRetainingCapacity();
             }
-        } else if (std.mem.startsWith(u8, line, "data:")) {
+        } else if (std.mem.startsWith(u8, text, "data:")) {
             if (data.written().len != 0) try data.writer.writeByte('\n');
-            try data.writer.writeAll(std.mem.trimStart(u8, line[5..], " "));
+            try data.writer.writeAll(std.mem.trimStart(u8, text[5..], " "));
         }
-        if (maybe_line == null) break;
+        if (end_of_stream) {
+            if (data.written().len != 0)
+                if (try processSseEvent(self, data.written(), expected_id, &last_parse_error)) |result| return result;
+            break;
+        }
     }
-    const rpc = last orelse {
-        if (last_parse_error) |err| {
-            std.debug.print("SSE contained no valid matching response; last JSON parse error: {s}\n", .{@errorName(err)});
-            return err;
-        }
-        return error.SseMissingResponse;
+    if (last_parse_error) |err| {
+        std.debug.print("SSE contained no valid matching response; last JSON parse error: {s}\n", .{@errorName(err)});
+        return err;
+    }
+    return error.SseMissingResponse;
+}
+
+fn processSseEvent(self: *McpClient, data: []const u8, expected_id: i64, last_parse_error: *?anyerror) !?Value {
+    const rpc = std.json.parseFromSliceLeaky(Value, self.allocator, data, .{}) catch |err| {
+        last_parse_error.* = err;
+        return null;
     };
-    const encoded = try jsonString(allocator, rpc);
-    return parseRpc(allocator, encoded, expected_id);
+    const events = if (rpc == .array) rpc.array.items else &[_]Value{rpc};
+    for (events) |event| {
+        if (getString(event, "method")) |method| {
+            if (get(event, "id")) |id| self.respondServerRequest(id, method) catch |err|
+                std.debug.print("failed to respond to server request '{s}': {s}\n", .{ method, @errorName(err) });
+            // Notifications have no id and require no response.
+        } else if (responseIdMatches(event, expected_id)) {
+            const encoded = try jsonString(self.allocator, event);
+            return try parseRpc(self.allocator, encoded, expected_id);
+        }
+    }
+    return null;
+}
+
+fn isReservedHeader(name: []const u8) bool {
+    const reserved = [_][]const u8{ "accept", "content-type", "mcp-protocol-version", "mcp-session-id" };
+    for (reserved) |candidate| if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    return false;
 }
 
 fn get(value: Value, key: []const u8) ?Value {
@@ -355,11 +409,68 @@ fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
     return if (value == .string) value.string else jsonString(allocator, value);
 }
 
-test "SSE returns last response" {
+test "parseRpc rejects mismatched id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ResponseIdMismatch, parseRpc(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}", 1));
+}
+
+test "parseRpc rejects missing jsonrpc field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidJsonRpcVersion, parseRpc(arena.allocator(), "{\"id\":1,\"result\":{}}", 1));
+}
+
+test "parseRpc handles batch array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseRpc(arena.allocator(), "[{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}},{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}]", 1);
+    try std.testing.expect(get(value, "ok").?.bool);
+}
+
+test "parseRpc rejects result and error together" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidJsonRpcResponse, parseRpc(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-1,\"message\":\"bad\"}}", 1));
+}
+
+test "validateRpcResponse rejects non-2.0 jsonrpc" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rpc = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{}}", .{});
+    try std.testing.expectError(error.InvalidJsonRpcVersion, validateRpcResponse(arena.allocator(), rpc, 1));
+}
+
+test "parseSse matches by id not last event" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var client = McpClient.init(arena.allocator(), std.testing.io, .{ .name = "test", .endpoint = "http://example.test" });
     defer client.deinit();
-    const value = try parseSse(&client, "data: nope\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":2}}\n\n", 1);
-    try std.testing.expectEqual(@as(i64, 2), get(value, "page").?.integer);
+    const value = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"wrong\":true}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":2}}\n\n", 1);
+    try std.testing.expectEqual(@as(i64, 1), get(value, "page").?.integer);
+}
+
+test "parseSse handles server ping request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var responses: std.ArrayList([]u8) = .empty;
+    var client = McpClient.init(arena.allocator(), std.testing.io, .{ .name = "test", .endpoint = "http://example.test" });
+    defer client.deinit();
+    client.test_server_responses = &responses;
+    _ = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
+    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
+    const response = try std.json.parseFromSliceLeaky(Value, arena.allocator(), responses.items[0], .{});
+    try std.testing.expect(get(response, "result").? == .object);
+    try std.testing.expectEqual(@as(usize, 0), get(response, "result").?.object.count());
+}
+
+test "parseSse handles server notification without response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var responses: std.ArrayList([]u8) = .empty;
+    var client = McpClient.init(arena.allocator(), std.testing.io, .{ .name = "test", .endpoint = "http://example.test" });
+    defer client.deinit();
+    client.test_server_responses = &responses;
+    _ = try parseSse(&client, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", 1);
+    try std.testing.expectEqual(@as(usize, 0), responses.items.len);
 }
