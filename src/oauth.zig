@@ -306,14 +306,9 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     }
     const issuer = authorization_server orelse origin;
     const metadata_url = try std.fmt.allocPrint(allocator, "{s}/.well-known/oauth-authorization-server", .{std.mem.trimEnd(u8, issuer, "/")});
-    const value = fetchJson(allocator, http, .GET, metadata_url, null, discovery_headers) catch {
-        const base = std.mem.trimEnd(u8, issuer, "/");
-        return .{
-            .authorization_endpoint = try std.fmt.allocPrint(allocator, "{s}/authorize", .{base}),
-            .token_endpoint = try std.fmt.allocPrint(allocator, "{s}/token", .{base}),
-            .registration_endpoint = try std.fmt.allocPrint(allocator, "{s}/register", .{base}),
-        };
-    };
+    // Discovery failure means the server cannot be authenticated against; do
+    // not guess endpoint paths. Surface the error so the caller aborts.
+    const value = try fetchJson(allocator, http, .GET, metadata_url, null, discovery_headers);
     return metadataFromJson(value);
 }
 
