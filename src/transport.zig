@@ -106,6 +106,13 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     }
     if (output.written().len > max_response_size) return error.ResponseTooLarge;
     const text = output.written();
+    const is_json = std.ascii.eqlIgnoreCase(base_type, "application/json");
+    if (is_json) if (expected_id) |id| {
+        self.server_supported_versions = try rpc.supportedVersionsFromError(self.allocator, text, id);
+        if (status.class() != .success) {
+            _ = rpc.parseRpc(self.allocator, text, id) catch |err| return err;
+        }
+    };
     if (status.class() != .success) {
         const log_limit = 1024;
         const displayed = text[0..@min(text.len, log_limit)];
@@ -113,18 +120,26 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
             std.debug.print("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
         else
             std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
-        return if (status == .unauthorized) error.HttpUnauthorized else error.HttpRequestFailed;
+        return classifyHttpFailure(status);
     }
     if (notification) return null;
-    if (std.ascii.eqlIgnoreCase(base_type, "application/json")) {
-        if (expected_id) |id| {
-            self.server_supported_versions = try rpc.supportedVersionsFromError(self.allocator, text, id);
-        }
-    }
-    if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
+    if (is_json)
         return try rpc.parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
     std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
     return error.UnsupportedContentType;
+}
+
+fn classifyHttpFailure(status: std.http.Status) anyerror {
+    return switch (status) {
+        .unauthorized => error.HttpUnauthorized,
+        .forbidden => error.HttpForbidden,
+        .too_many_requests => error.HttpRateLimited,
+        .not_found, .method_not_allowed => error.LegacyProbeRejected,
+        else => if (status.class() == .server_error)
+            error.HttpServerError
+        else
+            error.HttpRequestFailed,
+    };
 }
 
 pub fn waitForTimeout(io: Io, seconds: u64) void {
@@ -238,4 +253,72 @@ test "modern request headers derive method and name from structured context" {
     try std.testing.expectEqualStrings("tools/call", headers[2].value);
     try std.testing.expectEqualStrings("Mcp-Name", headers[3].name);
     try std.testing.expectEqualStrings("search", headers[3].value);
+}
+
+test "HTTP 400 unsupported-version response reaches JSON-RPC negotiation" {
+    const toml = @import("toml");
+    const test_http = @import("test_http.zig");
+    const TestClient = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        http: std.http.Client,
+        server: struct {
+            endpoint: []const u8,
+            headers: ?toml.HashMap([]const u8) = null,
+            oauth: ?void = null,
+        },
+        negotiated_version: []const u8 = "2026-07-28",
+        capabilities: struct {
+            has_sessions: bool = false,
+            has_mcp_method_header: bool = true,
+            has_mcp_name_header: bool = true,
+        } = .{},
+        session_id: ?[]const u8 = null,
+        authorization_header: ?[]const u8 = null,
+        oauth_challenge: ?@import("oauth.zig").OauthChallenge = null,
+        server_supported_versions: ?[]const []const u8 = null,
+
+        pub fn allowsServerRequests(_: *@This()) bool {
+            return false;
+        }
+
+        pub fn respondServerRequest(_: *@This(), _: Value, _: []const u8) !void {
+            return error.UnexpectedServerRequest;
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    const body =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"supported\":[\"2025-06-18\",\"2026-07-28\"]}}}";
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = "400 Bad Request", .body = body },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = TestClient{
+        .allocator = arena.allocator(),
+        .io = io,
+        .http = .{ .allocator = arena.allocator(), .io = io },
+        .server = .{ .endpoint = endpoint },
+    };
+    defer client.http.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedProtocolVersionError,
+        requestInner(&client, "{}", false, 1, .{ .method = "server/discover" }),
+    );
+    try serving.await(io);
+    const supported = client.server_supported_versions.?;
+    try std.testing.expectEqual(@as(usize, 2), supported.len);
+    try std.testing.expectEqualStrings("2025-06-18", supported[0]);
+    try std.testing.expectEqualStrings("2026-07-28", supported[1]);
 }

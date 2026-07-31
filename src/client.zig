@@ -103,7 +103,7 @@ pub const McpClient = struct {
                 break :blk try self.rpcUnchecked("server/discover", null);
             },
             // A 2025-03-26 server does not implement server/discover.
-            error.MethodNotFound, error.HttpRequestFailed => {
+            error.MethodNotFound, error.LegacyProbeRejected => {
                 try self.connectInitialized(protocol.legacy_version);
                 return;
             },
@@ -408,4 +408,125 @@ test "resultType supports complete input-required and legacy omission" {
     try std.testing.expectEqual(ResultType.complete, try resultType(complete, true));
     try std.testing.expectEqual(ResultType.input_required, try resultType(pending, true));
     try std.testing.expectEqual(ResultType.complete, try resultType(missing, false));
+}
+
+test "connect does not downgrade after HTTP 500" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = "500 Internal Server Error", .content_type = "text/plain", .body = "temporary failure" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpServerError, client.connect());
+    try serving.await(io);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(0), "MCP-Protocol-Version: 2026-07-28") != null);
+}
+
+test "connect does not downgrade after HTTP 429" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = "429 Too Many Requests", .content_type = "text/plain", .body = "slow down" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpRateLimited, client.connect());
+    try serving.await(io);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(0), "MCP-Protocol-Version: 2026-07-28") != null);
+}
+
+test "connect negotiates recognized HTTP 400 unsupported-version response" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "400 Bad Request",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"supported\":[\"2025-03-26\",\"2026-07-28\"]}}}",
+        },
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    try serving.await(io);
+    try std.testing.expectEqualStrings("2026-07-28", client.negotiated_version);
+    try std.testing.expect(client.supports_tools);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(1), "Mcp-Method: server/discover") != null);
+}
+
+test "negotiated legacy session is sent after initialize" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "400 Bad Request",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"supported\":[\"2025-06-18\"]}}}",
+        },
+        .{
+            .status = "200 OK",
+            .extra_headers = "Mcp-Session-Id: legacy-session\r\n",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"legacy\",\"version\":\"1\"}}}",
+        },
+        .{ .status = "202 Accepted", .body = "" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    try serving.await(io);
+    try std.testing.expectEqualStrings("2025-06-18", client.negotiated_version);
+    try std.testing.expectEqualStrings("legacy-session", client.session_id.?);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(1), "Mcp-Session-Id") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(2), "Mcp-Session-Id: legacy-session") != null);
 }
