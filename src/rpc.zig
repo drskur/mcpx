@@ -4,10 +4,19 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-const max_response_size = 16 * 1024 * 1024;
+pub const max_response_size = 16 * 1024 * 1024;
+
+/// `std.json.parseFromSliceLeaky` defaults to `.alloc_if_needed`, which makes
+/// `Value.string` alias the input buffer. Every parse here outlives its input,
+/// so strings are always copied into the allocator instead.
+const parse_options: std.json.ParseOptions = .{ .allocate = .alloc_always };
+
+pub fn parseJson(allocator: Allocator, text: []const u8) !Value {
+    return std.json.parseFromSliceLeaky(Value, allocator, text, parse_options);
+}
 
 pub fn parseRpc(allocator: Allocator, text: []const u8, expected_id: i64) !Value {
-    const rpc = try std.json.parseFromSliceLeaky(Value, allocator, text, .{});
+    const rpc = try parseJson(allocator, text);
     if (rpc == .array) {
         for (rpc.array.items) |item| {
             if (responseIdMatches(item, expected_id)) return validateRpcResponse(allocator, item, expected_id);
@@ -43,7 +52,7 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
 }
 
 pub fn supportedVersionsFromError(allocator: Allocator, text: []const u8, expected_id: i64) !?[]const []const u8 {
-    const envelope = try std.json.parseFromSliceLeaky(Value, allocator, text, .{});
+    const envelope = try parseJson(allocator, text);
     if (!responseIdMatches(envelope, expected_id)) return null;
     const rpc_error = get(envelope, "error") orelse return null;
     if (getInteger(rpc_error, "code") != -32022) return null;
@@ -149,7 +158,9 @@ fn processSseEvent(
     last_parse_error: *?anyerror,
     pending_server_requests: *std.ArrayList(PendingServerRequest),
 ) !?Value {
-    const rpc = std.json.parseFromSliceLeaky(Value, self.allocator, data, .{}) catch |err| {
+    // Copies every string out of `data`, which the caller reuses for the next
+    // event, so ids and methods stay valid after this event is processed.
+    const rpc = parseJson(self.allocator, data) catch |err| {
         last_parse_error.* = err;
         return null;
     };
@@ -167,8 +178,9 @@ fn processSseEvent(
         }
     }
     if (matching_response) |response| {
-        const encoded = try jsonString(self.allocator, response);
-        return try parseRpc(self.allocator, encoded, expected_id);
+        // Strings were copied by `parseJson`, so the event can be validated in
+        // place without an encode/parse round trip.
+        return try validateRpcResponse(self.allocator, response, expected_id);
     }
     return null;
 }

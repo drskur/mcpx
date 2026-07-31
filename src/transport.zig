@@ -3,8 +3,9 @@ const std = @import("std");
 const Io = std.Io;
 const Value = std.json.Value;
 const rpc = @import("rpc.zig");
+const clock = @import("clock.zig");
 
-const max_response_size = 16 * 1024 * 1024;
+const max_response_size = rpc.max_response_size;
 
 pub const RequestContext = struct {
     pub const ParamHeader = struct {
@@ -125,8 +126,10 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         return result.response;
     }
 
+    // The buffer must outlive this function: `std.json.Value` strings can
+    // reference the parsed input, and the parsed response is returned to the
+    // caller. `self.allocator` is documented to be arena or process scoped.
     var output: Io.Writer.Allocating = .init(self.allocator);
-    defer output.deinit();
     while (output.written().len <= max_response_size) {
         const remaining = max_response_size + 1 - output.written().len;
         _ = reader.stream(&output.writer, .limited(remaining)) catch |err| switch (err) {
@@ -135,7 +138,7 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         };
     }
     if (output.written().len > max_response_size) return error.ResponseTooLarge;
-    const text = output.written();
+    const text = try output.toOwnedSlice();
     const is_json = std.ascii.eqlIgnoreCase(base_type, "application/json");
     if (status.class() != .success) {
         // HTTP status controls failures except for the protocol negotiation
@@ -183,13 +186,7 @@ fn classifyHttpFailure(status: std.http.Status) anyerror {
     };
 }
 
-pub fn waitForTimeout(io: Io, seconds: u64) void {
-    const limited_seconds = @min(seconds, @as(u64, std.math.maxInt(i64)));
-    Io.Timeout.sleep(.{ .duration = .{
-        .clock = .awake,
-        .raw = .fromSeconds(@intCast(limited_seconds)),
-    } }, io) catch {};
-}
+pub const waitForTimeout = clock.waitForTimeout;
 
 pub fn notifyCancelled(self: anytype, id: i64) !void {
     var params = Value{ .object = .empty };

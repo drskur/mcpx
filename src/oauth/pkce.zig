@@ -24,10 +24,15 @@ pub fn generateState(io: Io, allocator: Allocator) ![]const u8 {
     return std.base64.url_safe_no_pad.Encoder.encode(result, &random);
 }
 
-pub fn fixedState(state: []const u8) [32]u8 {
-    var result = [_]u8{0} ** 32;
-    @memcpy(result[0..@min(result.len, state.len)], state[0..@min(result.len, state.len)]);
-    return result;
+/// Compares two `state` values in constant time regardless of length by
+/// comparing their digests, so callers cannot leak a prefix match.
+pub fn statesMatch(expected: []const u8, received: []const u8) bool {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var expected_digest: [Sha256.digest_length]u8 = undefined;
+    var received_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(expected, &expected_digest, .{});
+    Sha256.hash(received, &received_digest, .{});
+    return std.crypto.timing_safe.eql([Sha256.digest_length]u8, expected_digest, received_digest);
 }
 
 test "PKCE verifier and RFC 7636 challenge" {
@@ -47,4 +52,14 @@ test "generated states are non-empty and distinct" {
     const second = try generateState(std.testing.io, arena.allocator());
     try std.testing.expect(first.len > 0);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "state comparison rejects prefixes and length changes" {
+    try std.testing.expect(statesMatch("abc", "abc"));
+    try std.testing.expect(!statesMatch("abc", "abcd"));
+    try std.testing.expect(!statesMatch("abc", "ab"));
+    try std.testing.expect(!statesMatch("", "a"));
+    const long = "0123456789012345678901234567890123456789";
+    try std.testing.expect(statesMatch(long, long));
+    try std.testing.expect(!statesMatch(long, long[0..32] ++ "xxxxxxxx"));
 }
