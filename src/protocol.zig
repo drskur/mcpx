@@ -28,11 +28,13 @@ pub const versions = [_]Version{
         .has_cancel_notification = true,
     } },
     .{ .name = "2025-06-18", .capabilities = .{
+        .has_sessions = true,
         .allows_server_requests = true,
         .has_ping = true,
         .has_cancel_notification = true,
     } },
     .{ .name = "2025-11-25", .capabilities = .{
+        .has_sessions = true,
         .allows_server_requests = true,
         .has_ping = true,
         .has_cancel_notification = true,
@@ -66,9 +68,11 @@ pub fn bestMutualVersion(supported: []const []const u8) ?Version {
 
 test "capability table covers known protocol versions" {
     try std.testing.expect(capabilitiesFor("2025-03-26").?.has_sessions);
-    try std.testing.expect(!capabilitiesFor("2025-06-18").?.has_sessions);
+    try std.testing.expect(capabilitiesFor("2025-06-18").?.has_sessions);
+    try std.testing.expect(capabilitiesFor("2025-11-25").?.has_sessions);
     try std.testing.expect(!capabilitiesFor("2025-11-25").?.needs_meta);
     const modern = capabilitiesFor("2026-07-28").?;
+    try std.testing.expect(!modern.has_sessions);
     try std.testing.expect(modern.needs_discover);
     try std.testing.expect(modern.has_mcp_method_header);
     try std.testing.expect(modern.supports_result_type);
