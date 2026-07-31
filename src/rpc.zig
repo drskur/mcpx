@@ -35,9 +35,26 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
         const message = getString(err_value, "message") orelse return error.InvalidJsonRpcError;
         const code = displayScalar(allocator, code_value) catch "?";
         std.debug.print("RPC error [{s}]: {s}\n", .{ code, message });
+        if (code_value.integer == -32022) return error.UnsupportedProtocolVersionError;
         return error.JsonRpcError;
     }
     return result.?;
+}
+
+pub fn supportedVersionsFromError(allocator: Allocator, text: []const u8, expected_id: i64) !?[]const []const u8 {
+    const envelope = try std.json.parseFromSliceLeaky(Value, allocator, text, .{});
+    if (!responseIdMatches(envelope, expected_id)) return null;
+    const rpc_error = get(envelope, "error") orelse return null;
+    if (getInteger(rpc_error, "code") != -32022) return null;
+    const data = get(rpc_error, "data") orelse return null;
+    const supported = get(data, "supported") orelse return null;
+    if (supported != .array) return error.InvalidSupportedProtocolVersions;
+    var result: std.ArrayList([]const u8) = .empty;
+    for (supported.array.items) |item| {
+        if (item != .string) return error.InvalidSupportedProtocolVersions;
+        try result.append(allocator, item.string);
+    }
+    return try result.toOwnedSlice(allocator);
 }
 
 pub const PendingServerRequest = struct {
@@ -212,6 +229,16 @@ test "parseRpc rejects result and error together" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidJsonRpcResponse, parseRpc(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-1,\"message\":\"bad\"}}", 1));
+}
+
+test "unsupported protocol error exposes supported versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const text = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"supported\":[\"2025-03-26\",\"2026-07-28\"]}}}";
+    try std.testing.expectError(error.UnsupportedProtocolVersionError, parseRpc(arena.allocator(), text, 1));
+    const supported = (try supportedVersionsFromError(arena.allocator(), text, 1)).?;
+    try std.testing.expectEqual(@as(usize, 2), supported.len);
+    try std.testing.expectEqualStrings("2026-07-28", supported[1]);
 }
 
 test "validateRpcResponse rejects non-2.0 jsonrpc" {

@@ -11,6 +11,7 @@ const client_module = @import("client.zig");
 const cli = @import("cli.zig");
 const oauth = @import("oauth.zig");
 const skills = @import("skills.zig");
+const protocol = @import("protocol.zig");
 const McpClient = client_module.McpClient;
 const Server = client_module.Server;
 const Tool = client_module.Tool;
@@ -172,4 +173,5 @@ test {
     std.testing.refAllDecls(client_module);
     std.testing.refAllDecls(skills);
     std.testing.refAllDecls(oauth);
+    std.testing.refAllDecls(protocol);
 }

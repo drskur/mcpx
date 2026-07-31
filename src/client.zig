@@ -8,9 +8,9 @@ const toml = @import("toml");
 const rpc_module = @import("rpc.zig");
 const transport = @import("transport.zig");
 const oauth_module = @import("oauth.zig");
+const protocol = @import("protocol.zig");
 
 const version = "0.1.0";
-const protocol_version = "2025-03-26";
 const max_pagination_pages: usize = 1000;
 const max_pagination_tools: usize = 100_000;
 
@@ -44,7 +44,9 @@ pub const McpClient = struct {
     http: std.http.Client,
     server: Server,
     session_id: ?[]const u8 = null,
-    negotiated_version: []const u8 = protocol_version,
+    negotiated_version: []const u8 = protocol.latest_version,
+    capabilities: protocol.Capabilities = protocol.capabilitiesFor(protocol.latest_version).?,
+    server_supported_versions: ?[]const []const u8 = null,
     supports_tools: bool = false,
     next_id: u64 = 1,
     test_server_responses: ?*std.ArrayList([]u8) = null,
@@ -69,8 +71,38 @@ pub const McpClient = struct {
     }
 
     pub fn connect(self: *McpClient) anyerror!void {
+        self.negotiated_version = protocol.latest_version;
+        self.capabilities = protocol.capabilitiesFor(protocol.latest_version).?;
+        self.server_supported_versions = null;
+        const discovered = self.rpcUnchecked("server/discover", null) catch |err| switch (err) {
+            error.UnsupportedProtocolVersionError => blk: {
+                const supported = self.server_supported_versions orelse
+                    return error.UnsupportedProtocolVersion;
+                const selected = protocol.bestMutualVersion(supported) orelse
+                    return error.UnsupportedProtocolVersion;
+                self.negotiated_version = selected.name;
+                self.capabilities = selected.capabilities;
+                if (!selected.capabilities.needs_discover) {
+                    try self.connectLegacy();
+                    return;
+                }
+                break :blk try self.rpcUnchecked("server/discover", null);
+            },
+            // A 2025-03-26 server does not implement server/discover.
+            error.JsonRpcError => {
+                try self.connectLegacy();
+                return;
+            },
+            else => return err,
+        };
+        try self.applyDiscovery(discovered);
+    }
+
+    fn connectLegacy(self: *McpClient) !void {
+        self.negotiated_version = protocol.legacy_version;
+        self.capabilities = protocol.capabilitiesFor(protocol.legacy_version).?;
         var params = Value{ .object = .empty };
-        try params.object.put(self.allocator, "protocolVersion", .{ .string = protocol_version });
+        try params.object.put(self.allocator, "protocolVersion", .{ .string = protocol.legacy_version });
         try params.object.put(self.allocator, "capabilities", .{ .object = .empty });
         var info = Value{ .object = .empty };
         try info.object.put(self.allocator, "name", .{ .string = "mcpx" });
@@ -79,8 +111,22 @@ pub const McpClient = struct {
         const initialized = try self.rpc("initialize", params);
         const initialization = try validateInitialization(initialized);
         self.negotiated_version = initialization.negotiated_version;
+        self.capabilities = protocol.capabilitiesFor(initialization.negotiated_version) orelse
+            return error.UnsupportedProtocolVersion;
         self.supports_tools = initialization.supports_tools;
         try self.notifyInitialized();
+    }
+
+    fn applyDiscovery(self: *McpClient, discovered: Value) !void {
+        const negotiated = rpc_module.getString(discovered, "protocolVersion") orelse self.negotiated_version;
+        const caps = protocol.capabilitiesFor(negotiated) orelse return error.UnsupportedProtocolVersion;
+        const server_caps = rpc_module.get(discovered, "capabilities") orelse return error.DiscoverMissingCapabilities;
+        if (server_caps != .object) return error.DiscoverCapabilitiesMustBeObject;
+        self.negotiated_version = negotiated;
+        self.capabilities = caps;
+        const tools = rpc_module.get(server_caps, "tools");
+        if (tools) |value| if (value != .object) return error.DiscoverToolsCapabilityMustBeObject;
+        self.supports_tools = tools != null;
     }
 
     pub fn request(self: *McpClient, body: []const u8, notification: bool) !?Value {
@@ -139,7 +185,8 @@ pub const McpClient = struct {
                 }
                 if (err == error.SessionExpired and allow_session_recovery) {
                     self.session_id = null;
-                    self.negotiated_version = protocol_version;
+                    self.negotiated_version = protocol.legacy_version;
+                    self.capabilities = protocol.capabilitiesFor(protocol.legacy_version).?;
                     self.supports_tools = false;
                     try self.connect();
                     return self.requestExpectedWithTimeout(body, notification, expected_id, false, cancellable, initialize_request, timeout_secs);
@@ -176,6 +223,10 @@ pub const McpClient = struct {
     pub fn rpc(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
         if ((std.mem.eql(u8, method, "tools/list") or std.mem.eql(u8, method, "tools/call")) and !self.supports_tools)
             return error.ServerDoesNotSupportTools;
+        return self.rpcUnchecked(method, params);
+    }
+
+    fn rpcUnchecked(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
         var request_value = Value{ .object = .empty };
         try request_value.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
         const request_id: i64 = @intCast(self.next_id);
@@ -247,7 +298,7 @@ const Initialization = struct {
 
 fn validateInitialization(initialized: Value) !Initialization {
     const negotiated = rpc_module.getString(initialized, "protocolVersion") orelse return error.InitializeMissingProtocolVersion;
-    if (!std.mem.eql(u8, negotiated, protocol_version)) return error.UnsupportedProtocolVersion;
+    if (protocol.capabilitiesFor(negotiated) == null) return error.UnsupportedProtocolVersion;
     const capabilities = rpc_module.get(initialized, "capabilities") orelse return error.InitializeMissingCapabilities;
     if (capabilities != .object) return error.InitializeCapabilitiesMustBeObject;
     const server_info = rpc_module.get(initialized, "serverInfo") orelse return error.InitializeMissingServerInfo;

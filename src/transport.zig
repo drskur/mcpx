@@ -84,6 +84,11 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         return if (status == .unauthorized) error.HttpUnauthorized else error.HttpRequestFailed;
     }
     if (notification) return null;
+    if (std.ascii.eqlIgnoreCase(base_type, "application/json")) {
+        if (expected_id) |id| {
+            self.server_supported_versions = try rpc.supportedVersionsFromError(self.allocator, text, id);
+        }
+    }
     if (std.ascii.eqlIgnoreCase(base_type, "application/json"))
         return try rpc.parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
     std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
