@@ -90,12 +90,15 @@ pub fn ensureToken(
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
     const metadata = try discoverMetadata(allocator, http, endpoint, null);
-    if (tokens.get(metadata.issuer)) |stored| {
+    const resource = try canonicalResourceUri(allocator, endpoint);
+    const key = try tokenKey(allocator, metadata.issuer, resource);
+    if (tokens.get(key)) |stored| {
+        if (!tokenMatches(stored, metadata.issuer, resource)) return error.OauthTokenBindingMismatch;
         if (!tokenNeedsRefresh(stored, unixNow(io))) return stored;
         if (stored.refresh_token != null) {
             const refreshed = refreshToken(allocator, http, metadata, endpoint, stored) catch null;
             if (refreshed) |token| {
-                try tokens.put(allocator, metadata.issuer, token);
+                try tokens.put(allocator, key, token);
                 try saveTokens(io, allocator, token_path, tokens);
                 return token;
             }
@@ -134,9 +137,11 @@ pub fn recoverUnauthorized(
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
     const metadata = try discoverMetadata(allocator, http, endpoint, challenge);
-    if (tokens.get(metadata.issuer)) |stored| if (stored.refresh_token != null) {
+    const resource = try canonicalResourceUri(allocator, endpoint);
+    const key = try tokenKey(allocator, metadata.issuer, resource);
+    if (tokens.get(key)) |stored| if (tokenMatches(stored, metadata.issuer, resource) and stored.refresh_token != null) {
         if (refreshToken(allocator, http, metadata, endpoint, stored)) |token| {
-            try tokens.put(allocator, metadata.issuer, token);
+            try tokens.put(allocator, key, token);
             try saveTokens(io, allocator, token_path, tokens);
             return token;
         } else |_| {}
@@ -168,7 +173,7 @@ fn authenticateAndStore(
     const redirect_uri = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/callback", .{port});
 
     if (config.register and client_id == null) {
-        if (tokens.get(metadata.issuer)) |stored| {
+        if (findIssuerCredentials(tokens.*, metadata.issuer)) |stored| {
             client_id = stored.client_id;
             client_secret = stored.client_secret;
         }
@@ -178,7 +183,7 @@ fn authenticateAndStore(
         client_id = registered.client_id;
         client_secret = registered.client_secret;
     } else if (client_id == null) {
-        if (tokens.get(metadata.issuer)) |stored| {
+        if (findIssuerCredentials(tokens.*, metadata.issuer)) |stored| {
             client_id = stored.client_id;
             client_secret = stored.client_secret;
         }
@@ -194,8 +199,9 @@ fn authenticateAndStore(
         return error.OauthStateMismatch;
     try validateAuthorizationIssuer(metadata.issuer, metadata.authorization_response_iss_parameter_supported, received.issuer);
     const response = try exchangeCode(allocator, http, metadata.token_endpoint, received.code, verifier, redirect_uri, actual_client_id, client_secret, endpoint);
-    const token = tokenFromResponse(response, metadata.issuer, actual_client_id, client_secret, unixNow(io));
-    try tokens.put(allocator, metadata.issuer, token);
+    const resource = try canonicalResourceUri(allocator, endpoint);
+    const token = tokenFromResponse(response, metadata.issuer, resource, actual_client_id, client_secret, unixNow(io));
+    try tokens.put(allocator, try tokenKey(allocator, metadata.issuer, resource), token);
     try saveTokens(io, allocator, token_path, tokens.*);
     return token;
 }
@@ -287,6 +293,7 @@ fn refreshToken(allocator: Allocator, http: *std.http.Client, metadata: Metadata
     const parsed = try parseTokenResponse(try fetchJson(allocator, http, .POST, metadata.token_endpoint, form.written(), &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }}));
     return .{
         .issuer = metadata.issuer,
+        .resource = try canonicalResourceUri(allocator, endpoint),
         .access_token = parsed.access_token,
         .refresh_token = parsed.refresh_token orelse old.refresh_token,
         .token_type = parsed.token_type,
@@ -305,9 +312,10 @@ fn parseTokenResponse(value: Value) !TokenResponse {
     };
 }
 
-fn tokenFromResponse(response: TokenResponse, issuer: []const u8, client_id: []const u8, client_secret: ?[]const u8, now: i64) Token {
+fn tokenFromResponse(response: TokenResponse, issuer: []const u8, resource: []const u8, client_id: []const u8, client_secret: ?[]const u8, now: i64) Token {
     return .{
         .issuer = issuer,
+        .resource = resource,
         .access_token = response.access_token,
         .refresh_token = response.refresh_token,
         .token_type = response.token_type,
@@ -315,6 +323,50 @@ fn tokenFromResponse(response: TokenResponse, issuer: []const u8, client_id: []c
         .client_id = client_id,
         .client_secret = client_secret,
     };
+}
+
+fn tokenKey(allocator: Allocator, issuer: []const u8, resource: []const u8) ![]const u8 {
+    const raw = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ issuer, resource });
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
+    const result = try allocator.alloc(u8, "token-".len + encoded_len);
+    @memcpy(result[0.."token-".len], "token-");
+    _ = std.base64.url_safe_no_pad.Encoder.encode(result["token-".len..], raw);
+    return result;
+}
+
+fn tokenMatches(token: Token, issuer: []const u8, resource: []const u8) bool {
+    return std.mem.eql(u8, token.issuer, issuer) and
+        token.resource != null and std.mem.eql(u8, token.resource.?, resource);
+}
+
+fn findIssuerCredentials(tokens: TokenStore, issuer: []const u8) ?Token {
+    var iterator = tokens.iterator();
+    while (iterator.next()) |entry|
+        if (std.mem.eql(u8, entry.value_ptr.issuer, issuer) and entry.value_ptr.client_id != null)
+            return entry.value_ptr.*;
+    return null;
+}
+
+fn canonicalResourceUri(allocator: Allocator, input: []const u8) ![]const u8 {
+    var uri = try std.Uri.parse(input);
+    if (uri.host == null or uri.fragment != null) return error.OauthInvalidResourceUri;
+    uri.scheme = try std.ascii.allocLowerString(allocator, uri.scheme);
+    const host = try componentText(allocator, uri.host.?);
+    uri.host = .{ .raw = try std.ascii.allocLowerString(allocator, host) };
+    if ((std.mem.eql(u8, uri.scheme, "https") and uri.port == 443) or
+        (std.mem.eql(u8, uri.scheme, "http") and uri.port == 80))
+        uri.port = null;
+    var output: Io.Writer.Allocating = .init(allocator);
+    try uri.writeToStream(&output.writer, .{
+        .scheme = true,
+        .authentication = true,
+        .authority = true,
+        .path = true,
+        .query = true,
+        .fragment = false,
+        .port = true,
+    });
+    return output.toOwnedSlice();
 }
 
 fn openBrowser(io: Io, url: []const u8) void {
@@ -452,4 +504,28 @@ test "authorization and refresh token forms include resource" {
     try formField(&refresh_form.writer, "grant_type", "refresh_token", false);
     try formField(&refresh_form.writer, "resource", "https://mcp.example/mcp", true);
     try std.testing.expect(std.mem.indexOf(u8, refresh_form.written(), "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
+}
+
+test "tokens are keyed and verified by issuer and canonical resource" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const issuer = "https://issuer.example";
+    const first = try canonicalResourceUri(allocator, "HTTPS://MCP.EXAMPLE:443/mcp");
+    const same = try canonicalResourceUri(allocator, "https://mcp.example/mcp");
+    const different = try canonicalResourceUri(allocator, "https://mcp.example/other");
+    try std.testing.expectEqualStrings(first, same);
+    try std.testing.expectEqualStrings(
+        try tokenKey(allocator, issuer, first),
+        try tokenKey(allocator, issuer, same),
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        try tokenKey(allocator, issuer, first),
+        try tokenKey(allocator, issuer, different),
+    ));
+    const token: Token = .{ .issuer = issuer, .resource = first, .access_token = "bound" };
+    try std.testing.expect(tokenMatches(token, issuer, same));
+    try std.testing.expect(!tokenMatches(token, issuer, different));
+    try std.testing.expect(!tokenMatches(.{ .issuer = issuer, .access_token = "legacy" }, issuer, same));
 }
