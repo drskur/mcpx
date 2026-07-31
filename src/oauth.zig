@@ -23,6 +23,7 @@ const TokenStore = token_store.TokenStore;
 const loadTokens = token_store.loadTokens;
 const saveTokens = token_store.saveTokens;
 const tokenNeedsRefresh = token_store.tokenNeedsRefresh;
+const validateToken = token_store.validateToken;
 
 const percentDecode = callback.percentDecode;
 const bindCallback = callback.bindCallback;
@@ -41,6 +42,7 @@ const Metadata = struct {
     authorization_endpoint: []const u8,
     token_endpoint: []const u8,
     registration_endpoint: ?[]const u8 = null,
+    authorization_response_iss_parameter_supported: bool = false,
 };
 
 pub const OauthChallenge = struct {
@@ -192,7 +194,7 @@ fn authenticateAndStore(
     openBrowser(io, auth_url);
     const received = try acceptCallback(allocator, io, &callback_server, callback.default_timeout_secs);
     if (!statesMatch(state, received.state)) return error.OauthStateMismatch;
-    try validateAuthorizationIssuer(metadata.issuer, received.issuer);
+    try validateAuthorizationIssuer(metadata.issuer, received.issuer, metadata.authorization_response_iss_parameter_supported);
     const response = try exchangeCode(allocator, http, metadata.token_endpoint, received.code, verifier, redirect_uri, actual_client_id, client_secret, resource);
     const token = tokenFromResponse(response, metadata.issuer, resource, actual_client_id, client_secret, unixNow(io));
     try tokens.put(allocator, try tokenKey(allocator, metadata.issuer, resource), token);
@@ -247,6 +249,10 @@ fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const
     const authorization_endpoint = rpc.getString(value, "authorization_endpoint") orelse return error.OauthMetadataMissingAuthorizationEndpoint;
     const token_endpoint = rpc.getString(value, "token_endpoint") orelse return error.OauthMetadataMissingTokenEndpoint;
     const registration_endpoint = rpc.getString(value, "registration_endpoint");
+    const response_iss_supported = if (rpc.get(value, "authorization_response_iss_parameter_supported")) |supported| switch (supported) {
+        .bool => supported.bool,
+        else => return error.OauthMetadataInvalidAuthorizationResponseIssuerSupport,
+    } else false;
     // Credentials and codes must never travel over cleartext HTTP.
     try requireSecureUrl(allocator, authorization_endpoint);
     try requireSecureUrl(allocator, token_endpoint);
@@ -256,6 +262,7 @@ fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
         .registration_endpoint = registration_endpoint,
+        .authorization_response_iss_parameter_supported = response_iss_supported,
     };
 }
 
@@ -344,12 +351,14 @@ fn refreshToken(allocator: Allocator, http: *std.http.Client, metadata: Metadata
 }
 
 fn parseTokenResponse(value: Value) !TokenResponse {
-    return .{
+    const response: TokenResponse = .{
         .access_token = rpc.getString(value, "access_token") orelse return error.OauthTokenMissingAccessToken,
         .refresh_token = rpc.getString(value, "refresh_token"),
         .token_type = rpc.getString(value, "token_type") orelse "Bearer",
         .expires_in = rpc.getInteger(value, "expires_in"),
     };
+    try validateToken(.{ .issuer = "", .access_token = response.access_token, .token_type = response.token_type });
+    return response;
 }
 
 fn tokenFromResponse(response: TokenResponse, issuer: []const u8, resource: []const u8, client_id: []const u8, client_secret: ?[]const u8, now: i64) Token {
@@ -453,8 +462,11 @@ fn authorizationMetadataUrls(allocator: Allocator, issuer: []const u8) ![]const 
     return urls.toOwnedSlice(allocator);
 }
 
-pub fn validateAuthorizationIssuer(expected: []const u8, received: ?[]const u8) !void {
-    const issuer = received orelse return error.OauthAuthorizationIssuerMissing;
+pub fn validateAuthorizationIssuer(expected: []const u8, received: ?[]const u8, advertised: bool) !void {
+    const issuer = received orelse {
+        if (advertised) return error.OauthAuthorizationIssuerMissing;
+        return;
+    };
     if (!std.mem.eql(u8, expected, issuer)) return error.OauthAuthorizationIssuerMismatch;
 }
 
@@ -556,10 +568,31 @@ fn stringArray(allocator: Allocator, values: []const []const u8) !Value {
     return array;
 }
 
-test "authorization response issuer is always exact and required" {
-    try validateAuthorizationIssuer("https://issuer.example", "https://issuer.example");
-    try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", "https://other.example"));
-    try std.testing.expectError(error.OauthAuthorizationIssuerMissing, validateAuthorizationIssuer("https://issuer.example", null));
+test "authorization response issuer follows metadata advertisement" {
+    try validateAuthorizationIssuer("https://issuer.example", "https://issuer.example", true);
+    try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", "https://other.example", true));
+    try std.testing.expectError(error.OauthAuthorizationIssuerMissing, validateAuthorizationIssuer("https://issuer.example", null, true));
+    try validateAuthorizationIssuer("https://issuer.example", null, false);
+    try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", "https://other.example", false));
+}
+
+test "metadata and token response security fields are enforced" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const metadata_value = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"issuer":"https://issuer.example","authorization_endpoint":"https://issuer.example/auth","token_endpoint":"https://issuer.example/token","authorization_response_iss_parameter_supported":true}
+    , .{});
+    const metadata = try metadataFromJson(allocator, metadata_value, "https://issuer.example");
+    try std.testing.expect(metadata.authorization_response_iss_parameter_supported);
+    const injected = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"access_token":"safe\r\nInjected: yes","token_type":"Bearer"}
+    , .{});
+    try std.testing.expectError(error.InvalidTokenHeaderValue, parseTokenResponse(injected));
+    const unsupported = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"access_token":"value","token_type":"Basic"}
+    , .{});
+    try std.testing.expectError(error.UnsupportedTokenType, parseTokenResponse(unsupported));
 }
 
 test "WWW-Authenticate parser preserves resource metadata and scope" {

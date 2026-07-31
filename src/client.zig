@@ -277,6 +277,7 @@ pub const McpClient = struct {
     }
 
     fn setAuthorization(self: *McpClient, token: oauth_module.Token) !void {
+        try @import("oauth/token_store.zig").validateToken(token);
         self.authorization_header = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ token.token_type, token.access_token });
     }
 

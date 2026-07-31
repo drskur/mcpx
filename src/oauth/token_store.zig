@@ -16,6 +16,20 @@ pub const Token = struct {
 
 pub const TokenStore = std.StringHashMapUnmanaged(Token);
 
+pub fn validateToken(token: Token) !void {
+    if (!std.ascii.eqlIgnoreCase(token.token_type, "Bearer")) return error.UnsupportedTokenType;
+    try validateHeaderTokenField(token.token_type);
+    try validateHeaderTokenField(token.access_token);
+}
+
+fn validateHeaderTokenField(value: []const u8) !void {
+    if (value.len == 0 or value[0] == ' ' or value[0] == '\t' or
+        value[value.len - 1] == ' ' or value[value.len - 1] == '\t')
+        return error.InvalidTokenHeaderValue;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f)
+        return error.InvalidTokenHeaderValue;
+}
+
 pub fn serializeTokens(allocator: Allocator, tokens: TokenStore) ![]const u8 {
     var output: Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -141,7 +155,7 @@ pub fn parseTomlString(allocator: Allocator, raw: []const u8) ![]const u8 {
 }
 
 pub fn putBuilder(allocator: Allocator, result: *TokenStore, section: anytype) !void {
-    try result.put(allocator, section.name, .{
+    const token: Token = .{
         .issuer = section.issuer orelse section.name,
         .resource = section.resource,
         .access_token = section.access_token orelse return error.TokenMissingAccessToken,
@@ -150,7 +164,9 @@ pub fn putBuilder(allocator: Allocator, result: *TokenStore, section: anytype) !
         .expires_at = section.expires_at,
         .client_id = section.client_id,
         .client_secret = section.client_secret,
-    });
+    };
+    try validateToken(token);
+    try result.put(allocator, section.name, token);
 }
 
 pub fn tokenNeedsRefresh(token: Token, now: i64) bool {
@@ -212,4 +228,22 @@ test "token store keys can isolate credentials by issuer" {
     try tokens.put(arena.allocator(), "https://two.example", .{ .issuer = "https://two.example", .access_token = "two", .client_id = "two-client" });
     try std.testing.expectEqualStrings("one-client", tokens.get("https://one.example").?.client_id.?);
     try std.testing.expectEqualStrings("two-client", tokens.get("https://two.example").?.client_id.?);
+}
+
+test "token file rejects unsafe authorization header values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidTokenHeaderValue, parseTokens(arena.allocator(),
+        \\[bad]
+        \\issuer = "https://issuer.example"
+        \\access_token = "safe\nInjected: yes"
+        \\
+    ));
+    try std.testing.expectError(error.UnsupportedTokenType, parseTokens(arena.allocator(),
+        \\[bad]
+        \\issuer = "https://issuer.example"
+        \\access_token = "value"
+        \\token_type = "Basic"
+        \\
+    ));
 }
