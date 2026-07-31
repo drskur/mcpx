@@ -84,7 +84,9 @@ pub fn loadTokens(io: Io, allocator: Allocator, path: []const u8) !TokenStore {
 
 pub fn saveTokens(io: Io, allocator: Allocator, path: []const u8, tokens: TokenStore) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
-    try std.Io.Dir.cwd().createDirPath(io, parent);
+    // Refresh tokens live here, so the directory is owner-only just like the
+    // file that `createFileAtomic` writes below.
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, parent, @enumFromInt(0o700));
     var dir = try std.Io.Dir.cwd().openDir(io, parent, .{});
     defer dir.close(io);
     const basename = std.fs.path.basename(path);

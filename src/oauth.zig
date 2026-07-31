@@ -35,6 +35,8 @@ pub const OauthConfig = struct {
     register: bool = false,
 };
 
+const max_metadata_size = 1024 * 1024;
+
 const Metadata = struct {
     issuer: []const u8,
     resource: []const u8,
@@ -304,7 +306,9 @@ fn registerClient(allocator: Allocator, http: *std.http.Client, metadata: Metada
     try payload.object.put(allocator, "redirect_uris", try stringArray(allocator, &.{redirect_uri}));
     try payload.object.put(allocator, "grant_types", try stringArray(allocator, &.{ "authorization_code", "refresh_token" }));
     try payload.object.put(allocator, "response_types", try stringArray(allocator, &.{"code"}));
-    try payload.object.put(allocator, "token_endpoint_auth_method", .{ .string = "client_secret_post" });
+    // A CLI is a public client: PKCE replaces client authentication, so no
+    // secret has to be stored on disk (RFC 8252 section 8.4, OAuth 2.1).
+    try payload.object.put(allocator, "token_endpoint_auth_method", .{ .string = "none" });
     const body = try rpc.jsonString(allocator, payload);
     const value = try fetchJson(allocator, http, .POST, url, body, &.{.{ .name = "Content-Type", .value = "application/json" }});
     return .{
@@ -489,17 +493,44 @@ fn validateProtectedResourceMetadata(allocator: Allocator, value: Value, endpoin
 }
 
 fn fetchJson(allocator: Allocator, http: *std.http.Client, method: std.http.Method, url: []const u8, payload: ?[]const u8, headers: []const std.http.Header) !Value {
-    var output: Io.Writer.Allocating = .init(allocator);
-    defer output.deinit();
-    const response = try http.fetch(.{
+    // A fixed buffer caps what a remote server can make mcpx allocate; OAuth
+    // metadata and token responses are far smaller than this.
+    const buffer = try allocator.alloc(u8, max_metadata_size);
+    var output: Io.Writer = .fixed(buffer);
+    const response = http.fetch(.{
         .location = .{ .url = url },
         .method = method,
         .payload = payload,
-        .response_writer = &output.writer,
+        .response_writer = &output,
         .extra_headers = headers,
-    });
-    if (response.status.class() != .success) return error.OauthHttpRequestFailed;
-    return std.json.parseFromSliceLeaky(Value, allocator, output.written(), .{});
+    }) catch |err| switch (err) {
+        error.WriteFailed => return error.OauthResponseTooLarge,
+        else => return err,
+    };
+    const body = output.buffered();
+    if (response.status.class() != .success) {
+        reportOauthFailure(allocator, url, response.status, body);
+        return error.OauthHttpRequestFailed;
+    }
+    return rpc.parseJson(allocator, body);
+}
+
+/// Surfaces the RFC 6749 section 5.2 error body instead of discarding it.
+fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.Status, body: []const u8) void {
+    const displayed = body[0..@min(body.len, 512)];
+    if (rpc.parseJson(allocator, body)) |value| {
+        if (rpc.getString(value, "error")) |code| {
+            std.debug.print("OAuth request to {s} failed: HTTP {d}: {s}{s}{s}\n", .{
+                url,
+                @intFromEnum(status),
+                code,
+                if (rpc.getString(value, "error_description") != null) ": " else "",
+                rpc.getString(value, "error_description") orelse "",
+            });
+            return;
+        }
+    } else |_| {}
+    std.debug.print("OAuth request to {s} failed: HTTP {d}: {s}\n", .{ url, @intFromEnum(status), displayed });
 }
 
 fn originUrl(allocator: Allocator, uri: std.Uri) ![]const u8 {

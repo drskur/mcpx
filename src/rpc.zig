@@ -16,14 +16,36 @@ pub fn parseJson(allocator: Allocator, text: []const u8) !Value {
 }
 
 pub fn parseRpc(allocator: Allocator, text: []const u8, expected_id: i64) !Value {
+    return parseRpcDiagnosed(allocator, text, expected_id, null);
+}
+
+/// The structured JSON-RPC error of the last failed response, so the CLI can
+/// report `code`, `message` and `data` instead of a bare Zig error name.
+pub const RpcError = struct {
+    code: i64,
+    message: []const u8,
+    data: ?Value = null,
+};
+
+fn record(diagnostics: ?*?RpcError, value: RpcError) void {
+    if (diagnostics) |slot| slot.* = value;
+}
+
+/// Returns the diagnostics slot of clients that keep one, and `null` otherwise.
+fn diagnosticsOf(self: anytype) ?*?RpcError {
+    if (!@hasField(@TypeOf(self.*), "last_rpc_error")) return null;
+    return &self.last_rpc_error;
+}
+
+pub fn parseRpcDiagnosed(allocator: Allocator, text: []const u8, expected_id: i64, diagnostics: ?*?RpcError) !Value {
     const rpc = try parseJson(allocator, text);
     if (rpc == .array) {
         for (rpc.array.items) |item| {
-            if (responseIdMatches(item, expected_id)) return validateRpcResponse(allocator, item, expected_id);
+            if (responseIdMatches(item, expected_id)) return validateRpcResponse(allocator, item, expected_id, diagnostics);
         }
         return error.ResponseIdMismatch;
     }
-    return validateRpcResponse(allocator, rpc, expected_id);
+    return validateRpcResponse(allocator, rpc, expected_id, diagnostics);
 }
 
 fn responseIdMatches(rpc: Value, expected_id: i64) bool {
@@ -31,7 +53,8 @@ fn responseIdMatches(rpc: Value, expected_id: i64) bool {
     return id == .integer and id.integer == expected_id;
 }
 
-fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Value {
+fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64, diagnostics: ?*?RpcError) !Value {
+    _ = allocator;
     const jsonrpc = getString(rpc, "jsonrpc") orelse return error.InvalidJsonRpcVersion;
     if (!std.mem.eql(u8, jsonrpc, "2.0")) return error.InvalidJsonRpcVersion;
     if (!responseIdMatches(rpc, expected_id)) return error.ResponseIdMismatch;
@@ -42,8 +65,11 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
         const code_value = get(err_value, "code") orelse return error.InvalidJsonRpcError;
         if (code_value != .integer) return error.InvalidJsonRpcError;
         const message = getString(err_value, "message") orelse return error.InvalidJsonRpcError;
-        const code = displayScalar(allocator, code_value) catch "?";
-        std.debug.print("RPC error [{s}]: {s}\n", .{ code, message });
+        record(diagnostics, .{
+            .code = code_value.integer,
+            .message = message,
+            .data = get(err_value, "data"),
+        });
         if (code_value.integer == -32022) return error.UnsupportedProtocolVersionError;
         if (code_value.integer == -32601) return error.MethodNotFound;
         return error.JsonRpcError;
@@ -180,7 +206,7 @@ fn processSseEvent(
     if (matching_response) |response| {
         // Strings were copied by `parseJson`, so the event can be validated in
         // place without an encode/parse round trip.
-        return try validateRpcResponse(self.allocator, response, expected_id);
+        return try validateRpcResponse(self.allocator, response, expected_id, diagnosticsOf(self));
     }
     return null;
 }
@@ -262,7 +288,21 @@ test "validateRpcResponse rejects non-2.0 jsonrpc" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const value = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{}}", .{});
-    try std.testing.expectError(error.InvalidJsonRpcVersion, validateRpcResponse(arena.allocator(), value, 1));
+    try std.testing.expectError(error.InvalidJsonRpcVersion, validateRpcResponse(arena.allocator(), value, 1, null));
+}
+
+test "RPC errors are reported as structured diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostics: ?RpcError = null;
+    const text = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"bad params\",\"data\":{\"field\":\"query\"}}}";
+    try std.testing.expectError(
+        error.JsonRpcError,
+        parseRpcDiagnosed(arena.allocator(), text, 1, &diagnostics),
+    );
+    try std.testing.expectEqual(@as(i64, -32602), diagnostics.?.code);
+    try std.testing.expectEqualStrings("bad params", diagnostics.?.message);
+    try std.testing.expectEqualStrings("query", getString(diagnostics.?.data.?, "field").?);
 }
 
 test "parseSse matches by id not last event" {

@@ -24,7 +24,43 @@ pub const Server = struct {
     pub fn timeoutSecs(self: Server) u64 {
         return self.timeout_secs orelse 30;
     }
+
+    /// Rejects entries that would fail late, with a confusing error, or that
+    /// would make every request time out immediately.
+    pub fn validate(self: Server) !void {
+        if (self.name.len == 0) return error.ServerNameEmpty;
+        if (self.endpoint.len == 0) return error.ServerEndpointEmpty;
+        if (self.timeout_secs) |secs| if (secs == 0) return error.ServerTimeoutZero;
+        const uri = std.Uri.parse(self.endpoint) catch return error.ServerEndpointNotAbsoluteUri;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+            return error.ServerEndpointSchemeUnsupported;
+        if (uri.host == null) return error.ServerEndpointMissingHost;
+        if (self.headers) |headers| {
+            var it = headers.map.iterator();
+            while (it.next()) |entry| {
+                if (!isValidHeaderName(entry.key_ptr.*)) return error.ServerHeaderNameInvalid;
+                if (!isValidHeaderValue(entry.value_ptr.*)) return error.ServerHeaderValueInvalid;
+            }
+        }
+    }
 };
+
+/// RFC 9110 field name: a non-empty token. Anything else could smuggle a
+/// request line or header break into the connection.
+fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9' => {},
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isValidHeaderValue(value: []const u8) bool {
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
 
 pub const Tool = struct {
     value: Value,
@@ -78,6 +114,8 @@ pub const McpClient = struct {
     oauth_recovery_in_progress: bool = false,
     oauth_challenge: ?oauth_module.OauthChallenge = null,
     tool_header_mappings: std.StringHashMapUnmanaged([]const HeaderMapping) = .empty,
+    /// Populated by the transport whenever a JSON-RPC error response arrives.
+    last_rpc_error: ?rpc_module.RpcError = null,
 
     /// `allocator` MUST be an arena or process-scoped allocator that outlives
     /// the client. Individual allocations are intentionally not freed.
@@ -213,8 +251,6 @@ pub const McpClient = struct {
                 }
                 if (err == error.SessionExpired and self.capabilities.has_sessions and allow_session_recovery) {
                     self.session_id = null;
-                    self.negotiated_version = protocol.legacy_version;
-                    self.capabilities = protocol.capabilitiesFor(protocol.legacy_version).?;
                     self.supports_tools = false;
                     try self.connect();
                     return self.requestExpectedWithTimeout(body, notification, expected_id, false, cancellable, context, timeout_secs);
@@ -273,15 +309,23 @@ pub const McpClient = struct {
         self.next_id += 1;
         const body = try rpc_module.jsonString(self.allocator, request_value);
         const initialize_request = std.mem.eql(u8, method, "initialize");
+        const discovery_request = std.mem.eql(u8, method, "server/discover");
         const name = requestName(request_params);
         const param_headers = try self.paramHeaders(method, request_params);
+        self.last_rpc_error = null;
         const result = (try self.requestExpectedWithTimeout(
             body,
             false,
             request_id,
             true,
             !initialize_request,
-            .{ .method = method, .name = name, .param_headers = param_headers, .initialize = initialize_request },
+            .{
+                .method = method,
+                .name = name,
+                .param_headers = param_headers,
+                .initialize = initialize_request,
+                .probe = discovery_request,
+            },
             self.server.timeoutSecs(),
         )).?;
         return result;
@@ -791,4 +835,26 @@ test "session-expiring 404 reconnects and retries the request" {
     try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(3), "Mcp-Session-Id: old-session") != null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(4), "Mcp-Session-Id") == null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(7), "Mcp-Session-Id: new-session") != null);
+}
+
+test "server entries are validated before any request is made" {
+    const base: Server = .{ .name = "demo", .endpoint = "https://mcp.example/mcp" };
+    try base.validate();
+    try (Server{ .name = "demo", .endpoint = "http://127.0.0.1:3000/mcp", .timeout_secs = 1 }).validate();
+    try std.testing.expectError(error.ServerNameEmpty, (Server{ .name = "", .endpoint = "https://a.example/mcp" }).validate());
+    try std.testing.expectError(error.ServerEndpointEmpty, (Server{ .name = "demo", .endpoint = "" }).validate());
+    try std.testing.expectError(error.ServerTimeoutZero, (Server{ .name = "demo", .endpoint = "https://a.example/mcp", .timeout_secs = 0 }).validate());
+    try std.testing.expectError(error.ServerEndpointNotAbsoluteUri, (Server{ .name = "demo", .endpoint = "mcp.example/mcp" }).validate());
+    try std.testing.expectError(error.ServerEndpointSchemeUnsupported, (Server{ .name = "demo", .endpoint = "ftp://mcp.example/mcp" }).validate());
+}
+
+test "configured header names and values reject request smuggling" {
+    try std.testing.expect(isValidHeaderName("X-Custom_1"));
+    try std.testing.expect(!isValidHeaderName(""));
+    try std.testing.expect(!isValidHeaderName("X Custom"));
+    try std.testing.expect(!isValidHeaderName("X-Custom:"));
+    try std.testing.expect(!isValidHeaderName("X\r\nInjected"));
+    try std.testing.expect(isValidHeaderValue("plain value"));
+    try std.testing.expect(!isValidHeaderValue("value\r\nX-Injected: 1"));
+    try std.testing.expect(!isValidHeaderValue("tab\tvalue"));
 }

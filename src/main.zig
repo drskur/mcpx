@@ -10,6 +10,7 @@ const toml = @import("toml");
 const client_module = @import("client.zig");
 const cli = @import("cli.zig");
 const oauth = @import("oauth.zig");
+const rpc = @import("rpc.zig");
 const skills = @import("skills.zig");
 const protocol = @import("protocol.zig");
 const McpClient = client_module.McpClient;
@@ -23,7 +24,45 @@ const Config = struct {
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std.process.exit(exitCode(err));
+    };
+}
+
+/// Distinct exit codes let scripts react to the failure class without parsing
+/// the diagnostics on stderr.
+fn exitCode(err: anyerror) u8 {
+    const name = @errorName(err);
+    if (std.mem.startsWith(u8, name, "Oauth")) return 3;
+    if (std.mem.startsWith(u8, name, "Server") and !std.mem.eql(u8, name, "ServerDoesNotSupportTools")) return 2;
+    return switch (err) {
+        error.ConfigReadFailed,
+        error.ConfigParseFailed,
+        error.ConfigDuplicateServer,
+        error.HomeNotSet,
+        error.MissingConfigPath,
+        error.UnknownCommand,
+        error.UnknownOption,
+        error.MissingArgument,
+        error.TooManyArguments,
+        error.ArgsNotValidJson,
+        error.ArgsMustBeObject,
+        error.ToolNotFound,
+        => 2,
+        error.HttpUnauthorized, error.HttpForbidden => 3,
+        error.RequestTimedOut => 5,
+        error.ToolExecutionFailed => 6,
+        error.InputRequired => 7,
+        error.JsonRpcError,
+        error.MethodNotFound,
+        error.InvalidJsonRpcResponse,
+        error.InvalidJsonRpcVersion,
+        error.InvalidJsonRpcError,
+        error.ResponseIdMismatch,
+        error.UnsupportedProtocolVersion,
+        error.UnsupportedProtocolVersionError,
+        error.ServerDoesNotSupportTools,
+        => 4,
+        else => 1,
     };
 }
 
@@ -35,10 +74,8 @@ fn run(init: std.process.Init) !void {
         try cli.writeUsage(init.io);
         return;
     }
-    const path = if (parsed.config) |p| p else blk: {
-        const home = init.minimal.environ.getAlloc(allocator, "HOME") catch return error.HomeNotSet;
-        break :blk try std.fs.path.join(allocator, &.{ home, ".config/mcpx/config.toml" });
-    };
+    const config_home = configHome(allocator, init.minimal.environ) catch return error.HomeNotSet;
+    const path = if (parsed.config) |p| p else try std.fs.path.join(allocator, &.{ config_home, "mcpx/config.toml" });
     const raw = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(16 * 1024 * 1024)) catch {
         std.debug.print("cannot read config file: {s}\n", .{path});
         return error.ConfigReadFailed;
@@ -51,8 +88,8 @@ fn run(init: std.process.Init) !void {
     };
     defer parsed_config.deinit();
     const config = parsed_config.value;
-    const home = init.minimal.environ.getAlloc(allocator, "HOME") catch return error.HomeNotSet;
-    const token_path = try std.fs.path.join(allocator, &.{ home, ".config/mcpx/tokens.toml" });
+    try validateConfig(config);
+    const token_path = try std.fs.path.join(allocator, &.{ config_home, "mcpx/tokens.toml" });
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file.interface;
@@ -62,6 +99,28 @@ fn run(init: std.process.Init) !void {
         return err;
     };
     return command_result;
+}
+
+/// Honors `XDG_CONFIG_HOME` and falls back to `$HOME/.config`.
+fn configHome(allocator: Allocator, environ: anytype) ![]const u8 {
+    if (environ.getAlloc(allocator, "XDG_CONFIG_HOME")) |value| {
+        if (value.len != 0 and std.fs.path.isAbsolute(value)) return value;
+    } else |_| {}
+    const home = try environ.getAlloc(allocator, "HOME");
+    return std.fs.path.join(allocator, &.{ home, ".config" });
+}
+
+fn validateConfig(config: Config) !void {
+    for (config.http, 0..) |server, index| {
+        server.validate() catch |err| {
+            std.debug.print("invalid server entry #{d} ('{s}'): {s}\n", .{ index + 1, server.name, @errorName(err) });
+            return err;
+        };
+        for (config.http[0..index]) |earlier| if (std.mem.eql(u8, earlier.name, server.name)) {
+            std.debug.print("duplicate server name '{s}' in configuration\n", .{server.name});
+            return error.ConfigDuplicateServer;
+        };
+    }
 }
 
 fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Config, token_path: []const u8, out: *Io.Writer) !void {
@@ -91,14 +150,19 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
         var params = Value{ .object = .empty };
         try params.object.put(allocator, "name", .{ .string = parsed.positionals[1] });
         try params.object.put(allocator, "arguments", call_args);
-        const result = switch (try client.rpcOutcome("tools/call", params)) {
+        const outcome = client.rpcOutcome("tools/call", params) catch |err| return reportRpcFailure(&client, err);
+        const result = switch (outcome) {
             .complete => |value| value,
             .input_required => |value| value,
         };
         try skills.prettyPrint(out, result);
+        try out.flush();
+        // A tool that reports failure must not look successful to a script.
+        if (isToolError(result)) return error.ToolExecutionFailed;
+        if (outcome == .input_required) return error.InputRequired;
         return;
     }
-    const tools = try client.listTools();
+    const tools = client.listTools() catch |err| return reportRpcFailure(&client, err);
     if (std.mem.eql(u8, parsed.command, "list")) {
         if (tools.len == 0) return out.writeAll("no tools available.\n");
         for (tools) |tool| {
@@ -111,7 +175,24 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
             const tool = findTool(tools, parsed.positionals[1]) orelse return toolNotFound(parsed.positionals[1]);
             try skills.renderTool(out, allocator, tool);
         } else for (tools) |tool| try skills.renderTool(out, allocator, tool);
+    } else unreachable; // cli.parseArgs rejects every other command
+}
+
+fn isToolError(result: Value) bool {
+    const flag = rpc.get(result, "isError") orelse return false;
+    return flag == .bool and flag.bool;
+}
+
+/// Prints the structured JSON-RPC error recorded by the transport, which
+/// carries far more than the propagated Zig error name.
+fn reportRpcFailure(client: *McpClient, err: anyerror) anyerror {
+    if (client.last_rpc_error) |failure| {
+        std.debug.print("RPC error {d}: {s}\n", .{ failure.code, failure.message });
+        if (failure.data) |data| if (rpc.jsonString(client.allocator, data)) |text|
+            std.debug.print("RPC error data: {s}\n", .{text})
+        else |_| {};
     }
+    return err;
 }
 
 fn findServer(config: Config, name: []const u8) ?Server {
@@ -177,4 +258,43 @@ test {
     std.testing.refAllDecls(skills);
     std.testing.refAllDecls(oauth);
     std.testing.refAllDecls(protocol);
+}
+
+test "configuration rejects duplicate and malformed servers" {
+    try validateConfig(.{ .http = &.{
+        .{ .name = "one", .endpoint = "https://one.example/mcp" },
+        .{ .name = "two", .endpoint = "https://two.example/mcp" },
+    } });
+    try std.testing.expectError(error.ConfigDuplicateServer, validateConfig(.{ .http = &.{
+        .{ .name = "one", .endpoint = "https://one.example/mcp" },
+        .{ .name = "one", .endpoint = "https://other.example/mcp" },
+    } }));
+    try std.testing.expectError(error.ServerEndpointSchemeUnsupported, validateConfig(.{ .http = &.{
+        .{ .name = "one", .endpoint = "file:///etc/passwd" },
+    } }));
+}
+
+test "failure classes map to distinct exit codes" {
+    try std.testing.expectEqual(@as(u8, 2), exitCode(error.ConfigReadFailed));
+    try std.testing.expectEqual(@as(u8, 2), exitCode(error.UnknownOption));
+    try std.testing.expectEqual(@as(u8, 2), exitCode(error.ServerNotFound));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(error.HttpUnauthorized));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(error.OauthCallbackTimeout));
+    try std.testing.expectEqual(@as(u8, 4), exitCode(error.JsonRpcError));
+    try std.testing.expectEqual(@as(u8, 4), exitCode(error.ServerDoesNotSupportTools));
+    try std.testing.expectEqual(@as(u8, 5), exitCode(error.RequestTimedOut));
+    try std.testing.expectEqual(@as(u8, 6), exitCode(error.ToolExecutionFailed));
+    try std.testing.expectEqual(@as(u8, 7), exitCode(error.InputRequired));
+    try std.testing.expectEqual(@as(u8, 1), exitCode(error.OutOfMemory));
+}
+
+test "tool results that report failure are detected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const failed = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"isError\":true,\"content\":[]}", .{});
+    const ok = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"content\":[]}", .{});
+    const not_a_bool = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"isError\":\"yes\"}", .{});
+    try std.testing.expect(isToolError(failed));
+    try std.testing.expect(!isToolError(ok));
+    try std.testing.expect(!isToolError(not_a_bool));
 }

@@ -17,6 +17,10 @@ pub const RequestContext = struct {
     name: ?[]const u8 = null,
     param_headers: []const ParamHeader = &.{},
     initialize: bool = false,
+    /// Set for the modern discovery probe only. A 404 or 405 then means "this
+    /// server predates server/discover", while for every other request those
+    /// statuses stay ordinary HTTP failures.
+    probe: bool = false,
 };
 
 pub fn encodeHeaderValue(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -164,21 +168,36 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
             std.debug.print("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
         else
             std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
-        return classifyHttpFailure(status);
+        return classifyHttpFailure(status, context.probe);
     }
     if (notification) return null;
     if (is_json)
-        return try rpc.parseRpc(self.allocator, text, expected_id orelse return error.MissingExpectedResponseId);
+        return try rpc.parseRpcDiagnosed(
+            self.allocator,
+            text,
+            expected_id orelse return error.MissingExpectedResponseId,
+            diagnosticsSlot(self),
+        );
     std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
     return error.UnsupportedContentType;
 }
 
-fn classifyHttpFailure(status: std.http.Status) anyerror {
+fn diagnosticsSlot(self: anytype) ?*?rpc.RpcError {
+    if (!@hasField(@TypeOf(self.*), "last_rpc_error")) return null;
+    return &self.last_rpc_error;
+}
+
+fn classifyHttpFailure(status: std.http.Status, probe: bool) anyerror {
     return switch (status) {
         .unauthorized => error.HttpUnauthorized,
         .forbidden => error.HttpForbidden,
         .too_many_requests => error.HttpRateLimited,
-        .not_found, .method_not_allowed => error.LegacyProbeRejected,
+        .not_found, .method_not_allowed => if (probe)
+            error.LegacyProbeRejected
+        else if (status == .not_found)
+            error.HttpNotFound
+        else
+            error.HttpMethodNotAllowed,
         else => if (status.class() == .server_error)
             error.HttpServerError
         else
@@ -448,4 +467,13 @@ test "negotiation error takes precedence over session-bearing 404" {
     try std.testing.expectError(error.UnsupportedProtocolVersionError, requestInner(&client, "{}", false, 1, .{}));
     try serving.await(io);
     try std.testing.expectEqualStrings("2025-06-18", client.server_supported_versions.?[0]);
+}
+
+test "404 and 405 stay HTTP failures outside the discovery probe" {
+    try std.testing.expectEqual(error.LegacyProbeRejected, classifyHttpFailure(.not_found, true));
+    try std.testing.expectEqual(error.LegacyProbeRejected, classifyHttpFailure(.method_not_allowed, true));
+    try std.testing.expectEqual(error.HttpNotFound, classifyHttpFailure(.not_found, false));
+    try std.testing.expectEqual(error.HttpMethodNotAllowed, classifyHttpFailure(.method_not_allowed, false));
+    try std.testing.expectEqual(error.HttpUnauthorized, classifyHttpFailure(.unauthorized, true));
+    try std.testing.expectEqual(error.HttpServerError, classifyHttpFailure(.internal_server_error, true));
 }
