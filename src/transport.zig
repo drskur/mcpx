@@ -68,6 +68,15 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     const status = response.head.status;
     const content_type = try self.allocator.dupe(u8, response.head.content_type orelse "");
     const reason = try self.allocator.dupe(u8, response.head.reason);
+    if (status == .unauthorized) {
+        var challenge_headers = response.head.iterateHeaders();
+        while (challenge_headers.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "WWW-Authenticate")) {
+                self.oauth_challenge = try @import("oauth.zig").parseWwwAuthenticate(self.allocator, header.value);
+                break;
+            }
+        }
+    }
     if (self.capabilities.has_sessions and context.initialize and self.session_id == null) {
         var it = response.head.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "Mcp-Session-Id")) {

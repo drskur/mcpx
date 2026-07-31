@@ -66,6 +66,7 @@ pub const McpClient = struct {
     token_path: []const u8,
     authorization_header: ?[]const u8 = null,
     oauth_recovery_in_progress: bool = false,
+    oauth_challenge: ?oauth_module.OauthChallenge = null,
 
     /// `allocator` MUST be an arena or process-scoped allocator that outlives
     /// the client. Individual allocations are intentionally not freed.
@@ -192,6 +193,7 @@ pub const McpClient = struct {
                         self.server.endpoint,
                         self.server.oauth.?,
                         self.token_path,
+                        self.oauth_challenge,
                     );
                     try self.setAuthorization(token);
                     return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, context, timeout_secs);

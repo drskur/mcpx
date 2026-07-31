@@ -6,6 +6,7 @@ const Io = std.Io;
 pub const Callback = struct {
     code: []const u8,
     state: []const u8,
+    issuer: ?[]const u8 = null,
 };
 
 pub fn parseCallbackRequestLine(allocator: Allocator, line: []const u8) !Callback {
@@ -17,6 +18,7 @@ pub fn parseCallbackRequestLine(allocator: Allocator, line: []const u8) !Callbac
     const query_end = std.mem.indexOfScalarPos(u8, target, query_start, '#') orelse target.len;
     var code: ?[]const u8 = null;
     var state: ?[]const u8 = null;
+    var issuer: ?[]const u8 = null;
     var fields = std.mem.splitScalar(u8, target[query_start + 1 .. query_end], '&');
     while (fields.next()) |field| {
         const equals = std.mem.indexOfScalar(u8, field, '=') orelse continue;
@@ -24,11 +26,20 @@ pub fn parseCallbackRequestLine(allocator: Allocator, line: []const u8) !Callbac
         const decoded = try percentDecode(allocator, field[equals + 1 ..]);
         if (std.mem.eql(u8, name, "code")) code = decoded;
         if (std.mem.eql(u8, name, "state")) state = decoded;
+        if (std.mem.eql(u8, name, "iss")) issuer = decoded;
     }
     return .{
         .code = code orelse return error.CallbackMissingCode,
         .state = state orelse return error.CallbackMissingState,
+        .issuer = issuer,
     };
+}
+
+test "callback parses authorization response issuer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseCallbackRequestLine(arena.allocator(), "GET /callback?code=x&state=y&iss=https%3A%2F%2Fissuer.example HTTP/1.1");
+    try std.testing.expectEqualStrings("https://issuer.example", result.issuer.?);
 }
 
 pub fn percentDecode(allocator: Allocator, value: []const u8) ![]const u8 {

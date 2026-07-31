@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 pub const Token = struct {
+    issuer: []const u8,
     access_token: []const u8,
     refresh_token: ?[]const u8 = null,
     token_type: []const u8 = "Bearer",
@@ -20,6 +21,7 @@ pub fn serializeTokens(allocator: Allocator, tokens: TokenStore) ![]const u8 {
     var iterator = tokens.iterator();
     while (iterator.next()) |entry| {
         try output.writer.print("[{s}]\n", .{entry.key_ptr.*});
+        try writeTomlString(&output.writer, "issuer", entry.value_ptr.issuer);
         try writeTomlString(&output.writer, "access_token", entry.value_ptr.access_token);
         if (entry.value_ptr.refresh_token) |value| try writeTomlString(&output.writer, "refresh_token", value);
         try writeTomlString(&output.writer, "token_type", entry.value_ptr.token_type);
@@ -34,6 +36,7 @@ pub fn serializeTokens(allocator: Allocator, tokens: TokenStore) ![]const u8 {
 pub fn parseTokens(allocator: Allocator, input: []const u8) !TokenStore {
     const Builder = struct {
         name: []const u8,
+        issuer: ?[]const u8 = null,
         access_token: ?[]const u8 = null,
         refresh_token: ?[]const u8 = null,
         token_type: []const u8 = "Bearer",
@@ -61,7 +64,7 @@ pub fn parseTokens(allocator: Allocator, input: []const u8) !TokenStore {
             current.?.expires_at = try std.fmt.parseInt(i64, raw_value, 10);
         } else {
             const value = try parseTomlString(allocator, raw_value);
-            if (std.mem.eql(u8, key, "access_token")) current.?.access_token = value else if (std.mem.eql(u8, key, "refresh_token")) current.?.refresh_token = value else if (std.mem.eql(u8, key, "token_type")) current.?.token_type = value else if (std.mem.eql(u8, key, "client_id")) current.?.client_id = value else if (std.mem.eql(u8, key, "client_secret")) current.?.client_secret = value;
+            if (std.mem.eql(u8, key, "issuer")) current.?.issuer = value else if (std.mem.eql(u8, key, "access_token")) current.?.access_token = value else if (std.mem.eql(u8, key, "refresh_token")) current.?.refresh_token = value else if (std.mem.eql(u8, key, "token_type")) current.?.token_type = value else if (std.mem.eql(u8, key, "client_id")) current.?.client_id = value else if (std.mem.eql(u8, key, "client_secret")) current.?.client_secret = value;
         }
     }
     if (current) |section| try putBuilder(allocator, &result, section);
@@ -134,6 +137,7 @@ pub fn parseTomlString(allocator: Allocator, raw: []const u8) ![]const u8 {
 
 pub fn putBuilder(allocator: Allocator, result: *TokenStore, section: anytype) !void {
     try result.put(allocator, section.name, .{
+        .issuer = section.issuer orelse section.name,
         .access_token = section.access_token orelse return error.TokenMissingAccessToken,
         .refresh_token = section.refresh_token,
         .token_type = section.token_type,
@@ -149,11 +153,11 @@ pub fn tokenNeedsRefresh(token: Token, now: i64) bool {
 }
 
 test "token expiry includes sixty second refresh window" {
-    const token: Token = .{ .access_token = "a", .expires_at = 1000 };
+    const token: Token = .{ .issuer = "https://issuer.example", .access_token = "a", .expires_at = 1000 };
     try std.testing.expect(tokenNeedsRefresh(token, 1000));
     try std.testing.expect(tokenNeedsRefresh(token, 940));
     try std.testing.expect(!tokenNeedsRefresh(token, 939));
-    try std.testing.expect(!tokenNeedsRefresh(.{ .access_token = "a" }, 5000));
+    try std.testing.expect(!tokenNeedsRefresh(.{ .issuer = "https://issuer.example", .access_token = "a" }, 5000));
 }
 
 test "token TOML round trip preserves fields" {
@@ -161,6 +165,7 @@ test "token TOML round trip preserves fields" {
     defer arena.deinit();
     var tokens: TokenStore = .empty;
     try tokens.put(arena.allocator(), "github", .{
+        .issuer = "https://issuer.example",
         .access_token = "a\"b",
         .refresh_token = "refresh",
         .token_type = "Bearer",
@@ -172,8 +177,19 @@ test "token TOML round trip preserves fields" {
     var parsed = try parseTokens(arena.allocator(), encoded);
     const token = parsed.get("github").?;
     try std.testing.expectEqualStrings("a\"b", token.access_token);
+    try std.testing.expectEqualStrings("https://issuer.example", token.issuer);
     try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
     try std.testing.expectEqual(@as(?i64, 1754000000), token.expires_at);
     try std.testing.expectEqualStrings("client", token.client_id.?);
     try std.testing.expectEqualStrings("secret", token.client_secret.?);
+}
+
+test "token store keys can isolate credentials by issuer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tokens: TokenStore = .empty;
+    try tokens.put(arena.allocator(), "https://one.example", .{ .issuer = "https://one.example", .access_token = "one", .client_id = "one-client" });
+    try tokens.put(arena.allocator(), "https://two.example", .{ .issuer = "https://two.example", .access_token = "two", .client_id = "two-client" });
+    try std.testing.expectEqualStrings("one-client", tokens.get("https://one.example").?.client_id.?);
+    try std.testing.expectEqualStrings("two-client", tokens.get("https://two.example").?.client_id.?);
 }
