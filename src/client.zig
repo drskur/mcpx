@@ -38,6 +38,11 @@ pub const Tool = struct {
     }
 };
 
+const HeaderMapping = struct {
+    argument: []const u8,
+    header: []const u8,
+};
+
 pub const ResultType = enum {
     complete,
     input_required,
@@ -67,6 +72,7 @@ pub const McpClient = struct {
     authorization_header: ?[]const u8 = null,
     oauth_recovery_in_progress: bool = false,
     oauth_challenge: ?oauth_module.OauthChallenge = null,
+    tool_header_mappings: std.StringHashMapUnmanaged([]const HeaderMapping) = .empty,
 
     /// `allocator` MUST be an arena or process-scoped allocator that outlives
     /// the client. Individual allocations are intentionally not freed.
@@ -81,6 +87,7 @@ pub const McpClient = struct {
     }
 
     pub fn deinit(self: *McpClient) void {
+        self.tool_header_mappings.deinit(self.allocator);
         self.http.deinit();
     }
 
@@ -254,17 +261,40 @@ pub const McpClient = struct {
         const body = try rpc_module.jsonString(self.allocator, request_value);
         const initialize_request = std.mem.eql(u8, method, "initialize");
         const name = requestName(request_params);
+        const param_headers = try self.paramHeaders(method, request_params);
         const result = (try self.requestExpectedWithTimeout(
             body,
             false,
             request_id,
             true,
             !initialize_request,
-            .{ .method = method, .name = name, .initialize = initialize_request },
+            .{ .method = method, .name = name, .param_headers = param_headers, .initialize = initialize_request },
             self.server.timeoutSecs(),
         )).?;
         _ = try resultType(result, self.capabilities.supports_result_type);
         return result;
+    }
+
+    fn paramHeaders(self: *McpClient, method: []const u8, params: ?Value) ![]const transport.RequestContext.ParamHeader {
+        if (!self.capabilities.has_mcp_name_header or !std.mem.eql(u8, method, "tools/call")) return &.{};
+        const p = params orelse return &.{};
+        const tool_name = rpc_module.getString(p, "name") orelse return &.{};
+        const mappings = self.tool_header_mappings.get(tool_name) orelse return &.{};
+        const arguments = rpc_module.get(p, "arguments") orelse return &.{};
+        if (arguments != .object) return &.{};
+        var headers: std.ArrayList(transport.RequestContext.ParamHeader) = .empty;
+        for (mappings) |mapping| {
+            const value = arguments.object.get(mapping.argument) orelse continue;
+            const text: []const u8 = switch (value) {
+                .string => |string| string,
+                .integer => |integer| try std.fmt.allocPrint(self.allocator, "{d}", .{integer}),
+                .float => |float| try std.fmt.allocPrint(self.allocator, "{d}", .{float}),
+                .bool => |boolean| if (boolean) "true" else "false",
+                else => continue,
+            };
+            try headers.append(self.allocator, .{ .name = mapping.header, .value = text });
+        }
+        return headers.toOwnedSlice(self.allocator);
     }
 
     fn prepareParams(self: *McpClient, supplied: ?Value) !?Value {
@@ -321,7 +351,18 @@ pub const McpClient = struct {
             const list = rpc_module.get(result, "tools") orelse return error.ToolsListMissingTools;
             if (list != .array) return error.ToolsListMissingTools;
             try enforcePaginationLimits(page_count - 1, tools.items.len, list.array.items.len);
-            for (list.array.items) |tool| try tools.append(self.allocator, .{ .value = tool });
+            for (list.array.items) |tool| {
+                const mappings = validateHeaderMappings(self.allocator, tool) catch |err| {
+                    std.debug.print("warning: rejecting tool '{s}': {s}\n", .{
+                        rpc_module.getString(tool, "name") orelse "<unnamed>",
+                        @errorName(err),
+                    });
+                    continue;
+                };
+                if (rpc_module.getString(tool, "name")) |tool_name|
+                    try self.tool_header_mappings.put(self.allocator, tool_name, mappings);
+                try tools.append(self.allocator, .{ .value = tool });
+            }
             cursor = rpc_module.getString(result, "nextCursor");
             if (cursor == null or cursor.?.len == 0) break;
             const entry = try seen_cursors.getOrPut(self.allocator, cursor.?);
@@ -330,6 +371,34 @@ pub const McpClient = struct {
         return tools.toOwnedSlice(self.allocator);
     }
 };
+
+fn validateHeaderMappings(allocator: Allocator, tool: Value) ![]const HeaderMapping {
+    const schema = rpc_module.get(tool, "inputSchema") orelse return &.{};
+    if (schema != .object) return &.{};
+    const properties = rpc_module.get(schema, "properties") orelse return &.{};
+    if (properties != .object) return &.{};
+    var mappings: std.ArrayList(HeaderMapping) = .empty;
+    var property_iterator = properties.object.iterator();
+    while (property_iterator.next()) |entry| {
+        const property = entry.value_ptr.*;
+        const annotation_value = rpc_module.get(property, "x-mcp-header") orelse continue;
+        if (annotation_value != .string) return error.InvalidMcpHeaderAnnotation;
+        const header = annotation_value.string;
+        if (header.len == 0) return error.InvalidMcpHeaderAnnotation;
+        for (header) |byte| if (byte < 0x21 or byte > 0x7e or byte == ':')
+            return error.InvalidMcpHeaderAnnotation;
+        const property_type = rpc_module.getString(property, "type") orelse return error.InvalidMcpHeaderAnnotation;
+        if (!std.mem.eql(u8, property_type, "string") and
+            !std.mem.eql(u8, property_type, "number") and
+            !std.mem.eql(u8, property_type, "integer") and
+            !std.mem.eql(u8, property_type, "boolean"))
+            return error.InvalidMcpHeaderAnnotation;
+        for (mappings.items) |mapping| if (std.ascii.eqlIgnoreCase(mapping.header, header))
+            return error.InvalidMcpHeaderAnnotation;
+        try mappings.append(allocator, .{ .argument = entry.key_ptr.*, .header = header });
+    }
+    return mappings.toOwnedSlice(allocator);
+}
 
 const Initialization = struct {
     negotiated_version: []const u8,
@@ -434,6 +503,76 @@ test "resultType supports complete input-required and legacy omission" {
     try std.testing.expectEqual(ResultType.complete, try resultType(complete, true));
     try std.testing.expectEqual(ResultType.input_required, try resultType(pending, true));
     try std.testing.expectEqual(ResultType.complete, try resultType(missing, false));
+}
+
+test "tool header annotations are validated and primitive arguments are mirrored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const tool = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"name":"search","inputSchema":{"type":"object","properties":{
+        \\  "tenant":{"type":"string","x-mcp-header":"Tenant"},
+        \\  "limit":{"type":"integer","x-mcp-header":"Limit"},
+        \\  "debug":{"type":"boolean","x-mcp-header":"Debug"}
+        \\}}}
+    , .{});
+    const mappings = try validateHeaderMappings(allocator, tool);
+    try std.testing.expectEqual(@as(usize, 3), mappings.len);
+
+    var client = McpClient.init(allocator, std.testing.io, .{
+        .name = "test",
+        .endpoint = "https://example.test/mcp",
+    }, "unused");
+    defer client.deinit();
+    try client.tool_header_mappings.put(allocator, "search", mappings);
+    const params = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"name":"search","arguments":{"tenant":"acme","limit":7,"debug":true}}
+    , .{});
+    const headers = try client.paramHeaders("tools/call", params);
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("Tenant", headers[0].name);
+    try std.testing.expectEqualStrings("acme", headers[0].value);
+    try std.testing.expectEqualStrings("7", headers[1].value);
+    try std.testing.expectEqualStrings("true", headers[2].value);
+}
+
+test "invalid and non-primitive tool header annotations are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const invalid_name = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"inputSchema":{"properties":{"value":{"type":"string","x-mcp-header":"bad name"}}}}
+    , .{});
+    try std.testing.expectError(error.InvalidMcpHeaderAnnotation, validateHeaderMappings(allocator, invalid_name));
+    const duplicate = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"inputSchema":{"properties":{
+        \\  "one":{"type":"string","x-mcp-header":"Tenant"},
+        \\  "two":{"type":"number","x-mcp-header":"tenant"}
+        \\}}}
+    , .{});
+    try std.testing.expectError(error.InvalidMcpHeaderAnnotation, validateHeaderMappings(allocator, duplicate));
+    const object = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"inputSchema":{"properties":{"value":{"type":"object","x-mcp-header":"Value"}}}}
+    , .{});
+    try std.testing.expectError(error.InvalidMcpHeaderAnnotation, validateHeaderMappings(allocator, object));
+}
+
+test "non-primitive tool call argument is not emitted as a header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var client = McpClient.init(allocator, std.testing.io, .{
+        .name = "test",
+        .endpoint = "https://example.test/mcp",
+    }, "unused");
+    defer client.deinit();
+    try client.tool_header_mappings.put(allocator, "search", try allocator.dupe(HeaderMapping, &.{
+        .{ .argument = "tenant", .header = "Tenant" },
+    }));
+    const params = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"name":"search","arguments":{"tenant":{"nested":true}}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 0), (try client.paramHeaders("tools/call", params)).len);
 }
 
 test "connect does not downgrade after HTTP 500" {

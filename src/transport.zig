@@ -7,10 +7,36 @@ const rpc = @import("rpc.zig");
 const max_response_size = 16 * 1024 * 1024;
 
 pub const RequestContext = struct {
+    pub const ParamHeader = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
     method: ?[]const u8 = null,
     name: ?[]const u8 = null,
+    param_headers: []const ParamHeader = &.{},
     initialize: bool = false,
 };
+
+pub fn encodeHeaderValue(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var encode = value.len > 0 and (value[0] == ' ' or value[0] == '\t' or
+        value[value.len - 1] == ' ' or value[value.len - 1] == '\t');
+    if (std.mem.startsWith(u8, value, "=?base64?") and std.mem.endsWith(u8, value, "?="))
+        encode = true;
+    for (value) |byte| {
+        if (byte < 0x20 or byte > 0x7e) {
+            encode = true;
+            break;
+        }
+    }
+    if (!encode) return value;
+    const encoded_len = std.base64.standard.Encoder.calcSize(value.len);
+    const output = try allocator.alloc(u8, "=?base64?".len + encoded_len + "?=".len);
+    @memcpy(output[0.."=?base64?".len], "=?base64?");
+    _ = std.base64.standard.Encoder.encode(output["=?base64?".len..][0..encoded_len], value);
+    @memcpy(output["=?base64?".len + encoded_len ..], "?=");
+    return output;
+}
 
 pub fn requestHeaders(
     allocator: std.mem.Allocator,
@@ -24,7 +50,12 @@ pub fn requestHeaders(
     if (caps.has_mcp_method_header) if (context.method) |method|
         try headers.append(allocator, .{ .name = "Mcp-Method", .value = method });
     if (caps.has_mcp_name_header) if (context.name) |name|
-        try headers.append(allocator, .{ .name = "Mcp-Name", .value = name });
+        try headers.append(allocator, .{ .name = "Mcp-Name", .value = try encodeHeaderValue(allocator, name) });
+    for (context.param_headers) |header|
+        try headers.append(allocator, .{
+            .name = try std.fmt.allocPrint(allocator, "Mcp-Param-{s}", .{header.name}),
+            .value = try encodeHeaderValue(allocator, header.value),
+        });
     return headers.toOwnedSlice(allocator);
 }
 
@@ -292,6 +323,35 @@ test "modern request headers derive method and name from structured context" {
     try std.testing.expectEqualStrings("tools/call", headers[2].value);
     try std.testing.expectEqualStrings("Mcp-Name", headers[3].name);
     try std.testing.expectEqualStrings("search", headers[3].value);
+}
+
+test "modern request headers include encoded tool parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers = try requestHeaders(arena.allocator(), "2026-07-28", .{
+        .has_mcp_method_header = true,
+        .has_mcp_name_header = true,
+    }, .{
+        .method = "tools/call",
+        .name = "search",
+        .param_headers = &.{.{ .name = "Greeting", .value = "Hello, 世界" }},
+    });
+    try std.testing.expectEqualStrings("Mcp-Param-Greeting", headers[4].name);
+    try std.testing.expectEqualStrings("=?base64?SGVsbG8sIOS4lueVjA==?=", headers[4].value);
+}
+
+test "header values use the base64 sentinel only when required" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqualStrings("plain ASCII", try encodeHeaderValue(allocator, "plain ASCII"));
+    try std.testing.expectEqualStrings("=?base64?SGVsbG8sIOS4lueVjA==?=", try encodeHeaderValue(allocator, "Hello, 世界"));
+    try std.testing.expectEqualStrings("=?base64?IHBhZGRlZCA=?=", try encodeHeaderValue(allocator, " padded "));
+    try std.testing.expectEqualStrings("=?base64?bGluZTEKbGluZTI=?=", try encodeHeaderValue(allocator, "line1\nline2"));
+    try std.testing.expectEqualStrings(
+        "=?base64?PT9iYXNlNjQ/U0dWc2JHOD0/PQ==?=",
+        try encodeHeaderValue(allocator, "=?base64?SGVsbG8=?="),
+    );
 }
 
 test "HTTP 400 unsupported-version response reaches JSON-RPC negotiation" {
