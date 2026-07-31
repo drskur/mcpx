@@ -11,7 +11,6 @@ pub const Capabilities = struct {
     has_mcp_name_header: bool = false,
     supports_result_type: bool = false,
     allows_server_requests: bool = false,
-    has_ping: bool = false,
     has_cancel_notification: bool = false,
 };
 
@@ -24,19 +23,16 @@ pub const versions = [_]Version{
     .{ .name = "2025-03-26", .capabilities = .{
         .has_sessions = true,
         .allows_server_requests = true,
-        .has_ping = true,
         .has_cancel_notification = true,
     } },
     .{ .name = "2025-06-18", .capabilities = .{
         .has_sessions = true,
         .allows_server_requests = true,
-        .has_ping = true,
         .has_cancel_notification = true,
     } },
     .{ .name = "2025-11-25", .capabilities = .{
         .has_sessions = true,
         .allows_server_requests = true,
-        .has_ping = true,
         .has_cancel_notification = true,
     } },
     .{ .name = "2026-07-28", .capabilities = .{

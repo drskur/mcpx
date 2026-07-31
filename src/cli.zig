@@ -1,4 +1,6 @@
 const std = @import("std");
+const diagnostics_out = @import("diagnostics.zig");
+const build_info = @import("build_info");
 const Io = std.Io;
 
 pub const ParsedArgs = struct {
@@ -35,7 +37,7 @@ pub fn parseArgs(args: []const []const u8) !ParsedArgs {
         } else if (isFlag(arg)) {
             // Unknown options must not be silently consumed as a server, tool
             // or JSON argument.
-            std.debug.print("unknown option '{s}'\n", .{arg});
+            diagnostics_out.report("unknown option '{s}'\n", .{arg});
             return error.UnknownOption;
         } else if (command == null) command = arg else {
             if (count == positions.len) return error.TooManyArguments;
@@ -64,8 +66,8 @@ fn isFlag(arg: []const u8) bool {
 pub fn writeUsage(io: Io) !void {
     var buffer: [2048]u8 = undefined;
     var file: Io.File.Writer = .init(.stdout(), io, &buffer);
+    try file.interface.print("mcpx {s} - CLI bridge for MCP HTTP servers\n", .{build_info.version});
     try file.interface.writeAll(
-        \\mcpx 0.2.0 - CLI bridge for MCP HTTP servers
         \\
         \\Usage: mcpx [-c PATH] <COMMAND>
         \\

@@ -3,6 +3,15 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 const Tool = @import("client.zig").Tool;
+const json = @import("json.zig");
+
+const get = json.get;
+const getString = json.getString;
+const displayScalar = json.displayScalar;
+
+/// A server controls the schema it advertises, so rendering is bounded instead
+/// of recursing as deeply as the JSON parser allows.
+const max_schema_depth: usize = 16;
 
 pub fn renderTool(out: *Io.Writer, allocator: Allocator, tool: Tool) !void {
     try out.print("## {s}\n", .{tool.name() orelse return error.ToolMissingName});
@@ -24,6 +33,11 @@ pub fn prettyPrint(out: *Io.Writer, value: Value) !void {
 }
 
 fn renderSchema(out: *Io.Writer, allocator: Allocator, schema: Value, indent: usize) !void {
+    if (indent >= max_schema_depth) {
+        try spaces(out, indent);
+        try out.writeAll("- ... (schema nested too deeply)\n");
+        return;
+    }
     if (getString(schema, "$ref")) |ref| {
         try spaces(out, indent);
         try out.print("- Reference: `{s}`\n", .{ref});
@@ -61,10 +75,16 @@ fn isRequired(schema: Value, name: []const u8) bool {
 }
 
 fn schemaType(allocator: Allocator, schema: Value) ![]const u8 {
+    return schemaTypeAtDepth(allocator, schema, 0);
+}
+
+fn schemaTypeAtDepth(allocator: Allocator, schema: Value, depth: usize) ![]const u8 {
+    if (depth >= max_schema_depth) return "...";
     if (getString(schema, "$ref")) |ref| return std.fmt.allocPrint(allocator, "ref: {s}", .{ref});
     const kind = getString(schema, "type") orelse return "any";
     if (!std.mem.eql(u8, kind, "array")) return kind;
-    return std.fmt.allocPrint(allocator, "array of {s}", .{if (get(schema, "items")) |items| try schemaType(allocator, items) else "any"});
+    const items = get(schema, "items") orelse return "array of any";
+    return std.fmt.allocPrint(allocator, "array of {s}", .{try schemaTypeAtDepth(allocator, items, depth + 1)});
 }
 
 fn schemaDetails(out: *Io.Writer, allocator: Allocator, schema: Value) !void {
@@ -85,28 +105,8 @@ fn schemaDetails(out: *Io.Writer, allocator: Allocator, schema: Value) !void {
     if (!first) try out.writeByte(')');
 }
 
-fn get(value: Value, key: []const u8) ?Value {
-    return if (value == .object) value.object.get(key) else null;
-}
-
-fn getString(value: Value, key: []const u8) ?[]const u8 {
-    const v = get(value, key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn jsonString(allocator: Allocator, value: Value) ![]u8 {
-    var output: Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try std.json.Stringify.value(value, .{}, &output.writer);
-    return output.toOwnedSlice();
-}
-
-fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
-    return if (value == .string) value.string else jsonString(allocator, value);
-}
-
 fn parseTestJson(allocator: Allocator, text: []const u8) !Value {
-    return std.json.parseFromSliceLeaky(Value, allocator, text, .{});
+    return json.parse(allocator, text);
 }
 
 fn renderTestTool(allocator: Allocator) ![]const u8 {
@@ -146,4 +146,32 @@ test "prettyPrint produces indented JSON" {
     var output: Io.Writer.Allocating = .init(arena.allocator());
     try prettyPrint(&output.writer, value);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\n  \"outer\": {\n    \"value\": 1\n") != null);
+}
+
+test "deeply nested schemas are truncated instead of recursing without bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    const depth = max_schema_depth + 8;
+    for (0..depth) |_| try text.appendSlice(allocator, "{\"type\":\"object\",\"properties\":{\"next\":");
+    try text.appendSlice(allocator, "{\"type\":\"string\"}");
+    for (0..depth) |_| try text.appendSlice(allocator, "}}");
+    const schema = try json.parse(allocator, text.items);
+    var output: Io.Writer.Allocating = .init(allocator);
+    try renderSchema(&output.writer, allocator, schema, 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "schema nested too deeply") != null);
+}
+
+test "deeply nested array types are truncated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    const depth = max_schema_depth + 4;
+    for (0..depth) |_| try text.appendSlice(allocator, "{\"type\":\"array\",\"items\":");
+    try text.appendSlice(allocator, "{\"type\":\"string\"}");
+    for (0..depth) |_| try text.appendSlice(allocator, "}");
+    const schema = try json.parse(allocator, text.items);
+    try std.testing.expect(std.mem.endsWith(u8, try schemaType(allocator, schema), "array of ..."));
 }

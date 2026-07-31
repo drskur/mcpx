@@ -4,6 +4,7 @@ const Io = std.Io;
 const Value = std.json.Value;
 const rpc = @import("rpc.zig");
 const clock = @import("clock.zig");
+const diagnostics_out = @import("diagnostics.zig");
 
 const max_response_size = rpc.max_response_size;
 
@@ -64,7 +65,40 @@ pub fn requestHeaders(
     return headers.toOwnedSlice(allocator);
 }
 
+/// `requestInner` and the SSE parser take the client as `anytype` so tests can
+/// supply a light stand-in. This check replaces the silent duck typing with a
+/// comptime contract, so changing `McpClient` fails the build instead of
+/// quietly diverging from the test doubles.
+pub fn assertClient(comptime Client: type) void {
+    comptime {
+        const required_fields = .{
+            .{ "allocator", std.mem.Allocator },
+            .{ "io", Io },
+            .{ "http", std.http.Client },
+            .{ "negotiated_version", []const u8 },
+            .{ "session_id", ?[]const u8 },
+            .{ "authorization_header", ?[]const u8 },
+            .{ "server_supported_versions", ?[]const []const u8 },
+        };
+        for (required_fields) |field| {
+            if (!@hasField(Client, field[0]))
+                @compileError(@typeName(Client) ++ " is missing the client field '" ++ field[0] ++ "'");
+            if (@FieldType(Client, field[0]) != field[1])
+                @compileError(@typeName(Client) ++ "." ++ field[0] ++ " must be " ++ @typeName(field[1]));
+        }
+        for (.{ "server", "capabilities", "oauth_challenge" }) |name| {
+            if (!@hasField(Client, name))
+                @compileError(@typeName(Client) ++ " is missing the client field '" ++ name ++ "'");
+        }
+        for (.{ "allowsServerRequests", "respondServerRequest" }) |name| {
+            if (!@hasDecl(Client, name))
+                @compileError(@typeName(Client) ++ " is missing the client method '" ++ name ++ "'");
+        }
+    }
+}
+
 pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64, context: RequestContext) anyerror!?Value {
+    assertClient(@TypeOf(self.*));
     const uri = try std.Uri.parse(self.server.endpoint);
     var extra: std.ArrayList(std.http.Header) = .empty;
     defer extra.deinit(self.allocator);
@@ -79,7 +113,7 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         var it = headers.map.iterator();
         while (it.next()) |entry| {
             if (isReservedHeader(entry.key_ptr.*, self.server.oauth != null)) {
-                std.debug.print("warning: skipping reserved configured header '{s}'\n", .{entry.key_ptr.*});
+                diagnostics_out.warn("skipping reserved configured header '{s}'\n", .{entry.key_ptr.*});
                 continue;
             }
             try extra.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
@@ -165,9 +199,9 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         const log_limit = 1024;
         const displayed = text[0..@min(text.len, log_limit)];
         if (text.len > log_limit)
-            std.debug.print("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
+            diagnostics_out.report("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
         else
-            std.debug.print("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
+            diagnostics_out.report("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
         return classifyHttpFailure(status, context.probe);
     }
     if (notification) return null;
@@ -178,7 +212,7 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
             expected_id orelse return error.MissingExpectedResponseId,
             diagnosticsSlot(self),
         );
-    std.debug.print("unsupported response Content-Type: {s}\n", .{base_type});
+    diagnostics_out.report("unsupported response Content-Type: {s}\n", .{base_type});
     return error.UnsupportedContentType;
 }
 
@@ -476,4 +510,9 @@ test "404 and 405 stay HTTP failures outside the discovery probe" {
     try std.testing.expectEqual(error.HttpMethodNotAllowed, classifyHttpFailure(.method_not_allowed, false));
     try std.testing.expectEqual(error.HttpUnauthorized, classifyHttpFailure(.unauthorized, true));
     try std.testing.expectEqual(error.HttpServerError, classifyHttpFailure(.internal_server_error, true));
+}
+
+test "the client contract is enforced at comptime for the real client" {
+    assertClient(@import("client.zig").McpClient);
+    assertClient(TestClient);
 }

@@ -8,26 +8,25 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-pub const generateVerifier = pkce.generateVerifier;
-pub const codeChallenge = pkce.codeChallenge;
-pub const generateState = pkce.generateState;
+const clock = @import("clock.zig");
+const diagnostics_out = @import("diagnostics.zig");
+
+const generateVerifier = pkce.generateVerifier;
+const codeChallenge = pkce.codeChallenge;
+const generateState = pkce.generateState;
 const statesMatch = pkce.statesMatch;
+const unixNow = clock.unixNow;
 
+// `Token` is part of the client-facing API: the CLI turns it into a header.
 pub const Token = token_store.Token;
-pub const TokenStore = token_store.TokenStore;
-pub const serializeTokens = token_store.serializeTokens;
-pub const parseTokens = token_store.parseTokens;
-pub const loadTokens = token_store.loadTokens;
-pub const saveTokens = token_store.saveTokens;
-pub const tokenNeedsRefresh = token_store.tokenNeedsRefresh;
+const TokenStore = token_store.TokenStore;
+const loadTokens = token_store.loadTokens;
+const saveTokens = token_store.saveTokens;
+const tokenNeedsRefresh = token_store.tokenNeedsRefresh;
 
-pub const Callback = callback.Callback;
-pub const parseCallbackRequestLine = callback.parseCallbackRequestLine;
 const percentDecode = callback.percentDecode;
 const bindCallback = callback.bindCallback;
 const acceptCallback = callback.acceptCallback;
-const clock = @import("clock.zig");
-const unixNow = clock.unixNow;
 
 pub const OauthConfig = struct {
     client_id: ?[]const u8 = null,
@@ -39,7 +38,6 @@ const max_metadata_size = 1024 * 1024;
 
 const Metadata = struct {
     issuer: []const u8,
-    resource: []const u8,
     authorization_endpoint: []const u8,
     token_endpoint: []const u8,
     registration_endpoint: ?[]const u8 = null,
@@ -85,7 +83,6 @@ pub fn ensureToken(
     allocator: Allocator,
     io: Io,
     http: *std.http.Client,
-    server_name: []const u8,
     endpoint: []const u8,
     config: OauthConfig,
     token_path: []const u8,
@@ -107,7 +104,6 @@ pub fn ensureToken(
             }
         }
     }
-    _ = server_name;
     return authenticateAndStore(allocator, io, http, metadata, endpoint, config, token_path, &tokens);
 }
 
@@ -115,7 +111,6 @@ pub fn forceAuthenticate(
     allocator: Allocator,
     io: Io,
     http: *std.http.Client,
-    server_name: []const u8,
     endpoint: []const u8,
     config: OauthConfig,
     token_path: []const u8,
@@ -123,7 +118,6 @@ pub fn forceAuthenticate(
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
     const metadata = try discoverMetadata(allocator, http, endpoint, null);
-    _ = server_name;
     return authenticateAndStore(allocator, io, http, metadata, endpoint, config, token_path, &tokens);
 }
 
@@ -131,7 +125,6 @@ pub fn recoverUnauthorized(
     allocator: Allocator,
     io: Io,
     http: *std.http.Client,
-    server_name: []const u8,
     endpoint: []const u8,
     config: OauthConfig,
     token_path: []const u8,
@@ -149,7 +142,6 @@ pub fn recoverUnauthorized(
             return token;
         } else |_| {}
     };
-    _ = server_name;
     var effective = config;
     if (effective.scopes == null) {
         if (challenge) |value| effective.scopes = value.scope;
@@ -226,7 +218,7 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
         if (sameOrigin(allocator, url, endpoint)) |_|
             try candidates.append(allocator, url)
         else |err|
-            std.debug.print("ignoring WWW-Authenticate resource_metadata '{s}': {s}\n", .{ url, @errorName(err) });
+            diagnostics_out.warn("ignoring WWW-Authenticate resource_metadata '{s}': {s}\n", .{ url, @errorName(err) });
     };
     try candidates.appendSlice(allocator, &fallback_candidates);
     for (candidates.items) |url| {
@@ -240,8 +232,8 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
         const metadata_urls = try authorizationMetadataUrls(allocator, issuer);
         for (metadata_urls) |metadata_url| {
             const value = fetchJson(allocator, http, .GET, metadata_url, null, discovery_headers) catch continue;
-            return metadataFromJson(allocator, value, issuer, endpoint) catch |err| {
-                std.debug.print("rejecting authorization server metadata at {s}: {s}\n", .{ metadata_url, @errorName(err) });
+            return metadataFromJson(allocator, value, issuer) catch |err| {
+                diagnostics_out.warn("rejecting authorization server metadata at {s}: {s}\n", .{ metadata_url, @errorName(err) });
                 continue;
             };
         }
@@ -249,7 +241,7 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     return error.OauthMetadataDiscoveryFailed;
 }
 
-fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const u8, resource: []const u8) !Metadata {
+fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const u8) !Metadata {
     const issuer = rpc.getString(value, "issuer") orelse return error.OauthMetadataMissingIssuer;
     if (!std.mem.eql(u8, issuer, expected_issuer)) return error.OauthIssuerMismatch;
     const authorization_endpoint = rpc.getString(value, "authorization_endpoint") orelse return error.OauthMetadataMissingAuthorizationEndpoint;
@@ -261,7 +253,6 @@ fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const
     if (registration_endpoint) |url| try requireSecureUrl(allocator, url);
     return .{
         .issuer = issuer,
-        .resource = resource,
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
         .registration_endpoint = registration_endpoint,
@@ -422,7 +413,7 @@ fn canonicalResourceUri(allocator: Allocator, input: []const u8) ![]const u8 {
 }
 
 fn openBrowser(io: Io, url: []const u8) void {
-    std.debug.print("Open this URL to authorize mcpx:\n{s}\n", .{url});
+    diagnostics_out.report("Open this URL to authorize mcpx:\n{s}\n", .{url});
     if (@import("builtin").os.tag == .linux) {
         var child = std.process.spawn(io, .{ .argv = &.{ "xdg-open", url }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
         _ = child.wait(io) catch return;
@@ -520,7 +511,7 @@ fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.St
     const displayed = body[0..@min(body.len, 512)];
     if (rpc.parseJson(allocator, body)) |value| {
         if (rpc.getString(value, "error")) |code| {
-            std.debug.print("OAuth request to {s} failed: HTTP {d}: {s}{s}{s}\n", .{
+            diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: {s}{s}{s}\n", .{
                 url,
                 @intFromEnum(status),
                 code,
@@ -530,7 +521,7 @@ fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.St
             return;
         }
     } else |_| {}
-    std.debug.print("OAuth request to {s} failed: HTTP {d}: {s}\n", .{ url, @intFromEnum(status), displayed });
+    diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: {s}\n", .{ url, @intFromEnum(status), displayed });
 }
 
 fn originUrl(allocator: Allocator, uri: std.Uri) ![]const u8 {
@@ -685,12 +676,12 @@ test "authorization server metadata must not use cleartext endpoints" {
     , .{});
     try std.testing.expectError(
         error.OauthInsecureUrl,
-        metadataFromJson(allocator, insecure_token, "https://issuer.example", "https://mcp.example/mcp"),
+        metadataFromJson(allocator, insecure_token, "https://issuer.example"),
     );
     const loopback = try std.json.parseFromSliceLeaky(Value, allocator,
         \\{"issuer":"http://127.0.0.1:8080","authorization_endpoint":"http://127.0.0.1:8080/auth","token_endpoint":"http://127.0.0.1:8080/token"}
     , .{});
-    const metadata = try metadataFromJson(allocator, loopback, "http://127.0.0.1:8080", "http://127.0.0.1:3000/mcp");
+    const metadata = try metadataFromJson(allocator, loopback, "http://127.0.0.1:8080");
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/token", metadata.token_endpoint);
 }
 

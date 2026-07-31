@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const clock = @import("../clock.zig");
+const diagnostics_out = @import("../diagnostics.zig");
 
 /// A browser opens several connections to a loopback redirect URI (preconnect,
 /// `/favicon.ico`, retries). Non-callback requests are answered and ignored
@@ -99,7 +100,7 @@ pub fn acceptCallback(allocator: Allocator, io: Io, server: *std.Io.net.Server, 
     return switch (result) {
         .callback => |callback| callback,
         .timeout => {
-            std.debug.print("timed out after {d} seconds waiting for the OAuth redirect\n", .{timeout_secs});
+            diagnostics_out.report("timed out after {d} seconds waiting for the OAuth redirect\n", .{timeout_secs});
             return error.OauthCallbackTimeout;
         },
     };
@@ -111,7 +112,7 @@ fn acceptCallbackLoop(allocator: Allocator, io: Io, server: *std.Io.net.Server) 
         const stream = try server.accept(io);
         defer stream.close(io);
         const request = readCallbackRequest(allocator, io, stream) catch |err| {
-            std.debug.print("ignoring malformed request on the OAuth redirect port: {s}\n", .{@errorName(err)});
+            diagnostics_out.warn("ignoring malformed request on the OAuth redirect port: {s}\n", .{@errorName(err)});
             ignored += 1;
             continue;
         };
@@ -122,7 +123,7 @@ fn acceptCallbackLoop(allocator: Allocator, io: Io, server: *std.Io.net.Server) 
             },
             .denied => |failure| {
                 try respond(io, stream, "400 Bad Request", failure_html);
-                std.debug.print("authorization failed: {s}{s}{s}\n", .{
+                diagnostics_out.report("authorization failed: {s}{s}{s}\n", .{
                     failure.code,
                     if (failure.description != null) ": " else "",
                     failure.description orelse "",

@@ -4,8 +4,6 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-const version = "0.2.0";
-
 const toml = @import("toml");
 const client_module = @import("client.zig");
 const cli = @import("cli.zig");
@@ -13,6 +11,7 @@ const oauth = @import("oauth.zig");
 const rpc = @import("rpc.zig");
 const skills = @import("skills.zig");
 const protocol = @import("protocol.zig");
+const diagnostics_out = @import("diagnostics.zig");
 const McpClient = client_module.McpClient;
 const Server = client_module.Server;
 const Tool = client_module.Tool;
@@ -23,7 +22,7 @@ const Config = struct {
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        diagnostics_out.report("error: {s}\n", .{@errorName(err)});
         std.process.exit(exitCode(err));
     };
 }
@@ -77,13 +76,13 @@ fn run(init: std.process.Init) !void {
     const config_home = configHome(allocator, init.minimal.environ) catch return error.HomeNotSet;
     const path = if (parsed.config) |p| p else try std.fs.path.join(allocator, &.{ config_home, "mcpx/config.toml" });
     const raw = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(16 * 1024 * 1024)) catch {
-        std.debug.print("cannot read config file: {s}\n", .{path});
+        diagnostics_out.report("cannot read config file: {s}\n", .{path});
         return error.ConfigReadFailed;
     };
     var parser = toml.Parser(Config).init(allocator);
     defer parser.deinit();
     var parsed_config = parser.parseString(raw) catch |err| {
-        std.debug.print("failed to parse config {s}: {s}\n", .{ path, @errorName(err) });
+        diagnostics_out.report("failed to parse config {s}: {s}\n", .{ path, @errorName(err) });
         return error.ConfigParseFailed;
     };
     defer parsed_config.deinit();
@@ -95,7 +94,7 @@ fn run(init: std.process.Init) !void {
     const out = &stdout_file.interface;
     const command_result = runCommand(allocator, init.io, parsed, config, token_path, out);
     out.flush() catch |err| {
-        std.debug.print("failed to flush stdout: {s}\n", .{@errorName(err)});
+        diagnostics_out.report("failed to flush stdout: {s}\n", .{@errorName(err)});
         return err;
     };
     return command_result;
@@ -113,11 +112,11 @@ fn configHome(allocator: Allocator, environ: anytype) ![]const u8 {
 fn validateConfig(config: Config) !void {
     for (config.http, 0..) |server, index| {
         server.validate() catch |err| {
-            std.debug.print("invalid server entry #{d} ('{s}'): {s}\n", .{ index + 1, server.name, @errorName(err) });
+            diagnostics_out.report("invalid server entry #{d} ('{s}'): {s}\n", .{ index + 1, server.name, @errorName(err) });
             return err;
         };
         for (config.http[0..index]) |earlier| if (std.mem.eql(u8, earlier.name, server.name)) {
-            std.debug.print("duplicate server name '{s}' in configuration\n", .{server.name});
+            diagnostics_out.report("duplicate server name '{s}' in configuration\n", .{server.name});
             return error.ConfigDuplicateServer;
         };
     }
@@ -187,9 +186,9 @@ fn isToolError(result: Value) bool {
 /// carries far more than the propagated Zig error name.
 fn reportRpcFailure(client: *McpClient, err: anyerror) anyerror {
     if (client.last_rpc_error) |failure| {
-        std.debug.print("RPC error {d}: {s}\n", .{ failure.code, failure.message });
+        diagnostics_out.report("RPC error {d}: {s}\n", .{ failure.code, failure.message });
         if (failure.data) |data| if (rpc.jsonString(client.allocator, data)) |text|
-            std.debug.print("RPC error data: {s}\n", .{text})
+            diagnostics_out.report("RPC error data: {s}\n", .{text})
         else |_| {};
     }
     return err;
@@ -200,16 +199,16 @@ fn findServer(config: Config, name: []const u8) ?Server {
     return null;
 }
 fn printMissingServer(config: Config, name: []const u8) !void {
-    std.debug.print("server '{s}' not found. available: ", .{name});
-    for (config.http, 0..) |s, i| std.debug.print("{s}{s}", .{ if (i == 0) "" else ", ", s.name });
-    std.debug.print("\n", .{});
+    diagnostics_out.report("server '{s}' not found. available: ", .{name});
+    for (config.http, 0..) |s, i| diagnostics_out.report("{s}{s}", .{ if (i == 0) "" else ", ", s.name });
+    diagnostics_out.report("\n", .{});
 }
 fn findTool(tools: []const Tool, name: []const u8) ?Tool {
     for (tools) |t| if (t.name()) |n| if (std.mem.eql(u8, n, name)) return t;
     return null;
 }
 fn toolNotFound(name: []const u8) error{ToolNotFound} {
-    std.debug.print("tool '{s}' not found\n", .{name});
+    diagnostics_out.report("tool '{s}' not found\n", .{name});
     return error.ToolNotFound;
 }
 fn firstLine(s: []const u8) []const u8 {

@@ -9,8 +9,10 @@ const rpc_module = @import("rpc.zig");
 const transport = @import("transport.zig");
 const oauth_module = @import("oauth.zig");
 const protocol = @import("protocol.zig");
+const build_info = @import("build_info");
+const diagnostics_out = @import("diagnostics.zig");
 
-const version = "0.2.0";
+const version = build_info.version;
 const max_pagination_pages: usize = 1000;
 const max_pagination_tools: usize = 100_000;
 
@@ -194,10 +196,6 @@ pub const McpClient = struct {
         self.supports_tools = tools != null;
     }
 
-    pub fn request(self: *McpClient, body: []const u8, notification: bool) !?Value {
-        return self.requestExpected(body, notification, null, true, false, .{});
-    }
-
     pub fn requestExpected(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, allow_session_recovery: bool, cancellable: bool, context: transport.RequestContext) anyerror!?Value {
         return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, context, self.server.timeoutSecs());
     }
@@ -217,7 +215,6 @@ pub const McpClient = struct {
                 self.allocator,
                 self.io,
                 &self.http,
-                self.server.name,
                 self.server.endpoint,
                 oauth_config,
                 self.token_path,
@@ -240,7 +237,6 @@ pub const McpClient = struct {
                         self.allocator,
                         self.io,
                         &self.http,
-                        self.server.name,
                         self.server.endpoint,
                         self.server.oauth.?,
                         self.token_path,
@@ -258,9 +254,9 @@ pub const McpClient = struct {
                 return err;
             },
             .timeout => {
-                std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, timeout_secs });
+                diagnostics_out.report("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, timeout_secs });
                 if (cancellable and self.capabilities.has_cancel_notification) if (expected_id) |id| transport.notifyCancelled(self, id) catch |err|
-                    std.debug.print("failed to send cancellation for request {d}: {s}\n", .{ id, @errorName(err) });
+                    diagnostics_out.warn("failed to send cancellation for request {d}: {s}\n", .{ id, @errorName(err) });
                 return error.RequestTimedOut;
             },
         };
@@ -272,7 +268,6 @@ pub const McpClient = struct {
             self.allocator,
             self.io,
             &self.http,
-            self.server.name,
             self.server.endpoint,
             config,
             self.token_path,
@@ -396,7 +391,7 @@ pub const McpClient = struct {
         var cursor: ?[]const u8 = null;
         var page_count: usize = 0;
         while (true) {
-            try enforcePaginationLimits(page_count, tools.items.len, 0);
+            try enforcePageLimit(page_count);
             page_count += 1;
             var params: ?Value = null;
             if (cursor) |c| {
@@ -410,17 +405,23 @@ pub const McpClient = struct {
             };
             const list = rpc_module.get(result, "tools") orelse return error.ToolsListMissingTools;
             if (list != .array) return error.ToolsListMissingTools;
-            try enforcePaginationLimits(page_count - 1, tools.items.len, list.array.items.len);
+            try enforceToolLimit(tools.items.len, list.array.items.len);
             for (list.array.items) |tool| {
-                const mappings = validateHeaderMappings(self.allocator, tool) catch |err| {
-                    std.debug.print("warning: rejecting tool '{s}': {s}\n", .{
-                        rpc_module.getString(tool, "name") orelse "<unnamed>",
-                        @errorName(err),
-                    });
+                // A tool without a name cannot be listed, documented or
+                // called, so it is rejected here instead of failing later.
+                const tool_name = rpc_module.getString(tool, "name") orelse {
+                    diagnostics_out.warn("skipping tool without a name\n", .{});
                     continue;
                 };
-                if (rpc_module.getString(tool, "name")) |tool_name|
-                    try self.tool_header_mappings.put(self.allocator, tool_name, mappings);
+                const mappings = validateHeaderMappings(self.allocator, tool) catch |err| {
+                    diagnostics_out.warn("rejecting tool '{s}': {s}\n", .{ tool_name, @errorName(err) });
+                    continue;
+                };
+                if (self.tool_header_mappings.contains(tool_name)) {
+                    diagnostics_out.warn("skipping duplicate tool '{s}'\n", .{tool_name});
+                    continue;
+                }
+                try self.tool_header_mappings.put(self.allocator, tool_name, mappings);
                 try tools.append(self.allocator, .{ .value = tool });
             }
             cursor = rpc_module.getString(result, "nextCursor");
@@ -486,8 +487,11 @@ fn validateInitialization(initialized: Value) !Initialization {
     return .{ .negotiated_version = negotiated, .supports_tools = tools != null };
 }
 
-fn enforcePaginationLimits(page_count: usize, total_tools: usize, additional_tools: usize) !void {
+fn enforcePageLimit(page_count: usize) !void {
     if (page_count >= max_pagination_pages) return error.PaginationLimitExceeded;
+}
+
+fn enforceToolLimit(total_tools: usize, additional_tools: usize) !void {
     if (additional_tools > max_pagination_tools -| total_tools) return error.PaginationLimitExceeded;
 }
 
@@ -541,8 +545,10 @@ test "initialization requires tools capability to be an object" {
 }
 
 test "pagination aggregate limits are enforced" {
-    try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(max_pagination_pages, 0, 0));
-    try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(1, max_pagination_tools, 1));
+    try enforcePageLimit(max_pagination_pages - 1);
+    try std.testing.expectError(error.PaginationLimitExceeded, enforcePageLimit(max_pagination_pages));
+    try enforceToolLimit(max_pagination_tools - 1, 1);
+    try std.testing.expectError(error.PaginationLimitExceeded, enforceToolLimit(max_pagination_tools, 1));
 }
 
 test "modern params receive protocol client metadata" {

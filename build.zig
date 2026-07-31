@@ -1,8 +1,14 @@
 const std = @import("std");
 
+/// The package manifest is the single source of truth for the version that
+/// mcpx reports over MCP and in `--help`.
+const manifest_version = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", manifest_version);
     const strip: ?bool = if (optimize != .Debug) true else null;
     const toml_dep = b.dependency("toml", .{
         .target = target,
@@ -17,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
             .imports = &.{
                 .{ .name = "toml", .module = toml_dep.module("toml") },
+                .{ .name = "build_info", .module = build_info.createModule() },
             },
         }),
     });

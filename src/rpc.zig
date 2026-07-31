@@ -6,14 +6,14 @@ const Value = std.json.Value;
 
 pub const max_response_size = 16 * 1024 * 1024;
 
-/// `std.json.parseFromSliceLeaky` defaults to `.alloc_if_needed`, which makes
-/// `Value.string` alias the input buffer. Every parse here outlives its input,
-/// so strings are always copied into the allocator instead.
-const parse_options: std.json.ParseOptions = .{ .allocate = .alloc_always };
+const json = @import("json.zig");
+const diagnostics_out = @import("diagnostics.zig");
 
-pub fn parseJson(allocator: Allocator, text: []const u8) !Value {
-    return std.json.parseFromSliceLeaky(Value, allocator, text, parse_options);
-}
+pub const get = json.get;
+pub const getString = json.getString;
+pub const getInteger = json.getInteger;
+pub const parseJson = json.parse;
+pub const jsonString = json.stringify;
 
 pub fn parseRpc(allocator: Allocator, text: []const u8, expected_id: i64) !Value {
     return parseRpcDiagnosed(allocator, text, expected_id, null);
@@ -107,7 +107,21 @@ fn parseSse(self: anytype, body: []const u8, expected_id: i64) !SseResult {
     return parseSseReader(self, &reader, expected_id);
 }
 
+/// Minimal contract for the SSE parser: an allocator, a way to decide whether
+/// server-initiated requests are allowed, and a way to answer them.
+fn assertSseClient(comptime Client: type) void {
+    comptime {
+        if (@FieldType(Client, "allocator") != Allocator)
+            @compileError(@typeName(Client) ++ ".allocator must be std.mem.Allocator");
+        for (.{ "allowsServerRequests", "respondServerRequest" }) |name| {
+            if (!@hasDecl(Client, name))
+                @compileError(@typeName(Client) ++ " is missing the client method '" ++ name ++ "'");
+        }
+    }
+}
+
 pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !SseResult {
+    assertSseClient(@TypeOf(self.*));
     const allocator = self.allocator;
     var last_parse_error: ?anyerror = null;
     var data: Io.Writer.Allocating = .init(allocator);
@@ -155,7 +169,7 @@ pub fn parseSseReader(self: anytype, reader: *Io.Reader, expected_id: i64) !SseR
         }
     }
     if (last_parse_error) |err| {
-        std.debug.print("SSE contained no valid matching response; last JSON parse error: {s}\n", .{@errorName(err)});
+        diagnostics_out.warn("SSE contained no valid matching response; last JSON parse error: {s}\n", .{@errorName(err)});
         return err;
     }
     return error.SseMissingResponse;
@@ -172,7 +186,7 @@ fn processAndDispatchSseEvent(
     const response = try processSseEvent(self, data, expected_id, last_parse_error, &pending_server_requests);
     for (pending_server_requests.items) |pending| {
         self.respondServerRequest(pending.id, pending.method) catch |err|
-            std.debug.print("failed to respond to server request '{s}': {s}\n", .{ pending.method, @errorName(err) });
+            diagnostics_out.warn("failed to respond to server request '{s}': {s}\n", .{ pending.method, @errorName(err) });
     }
     return response;
 }
@@ -209,31 +223,6 @@ fn processSseEvent(
         return try validateRpcResponse(self.allocator, response, expected_id, diagnosticsOf(self));
     }
     return null;
-}
-
-pub fn get(value: Value, key: []const u8) ?Value {
-    return if (value == .object) value.object.get(key) else null;
-}
-
-pub fn getString(value: Value, key: []const u8) ?[]const u8 {
-    const value_at_key = get(value, key) orelse return null;
-    return if (value_at_key == .string) value_at_key.string else null;
-}
-
-pub fn getInteger(value: Value, key: []const u8) ?i64 {
-    const value_at_key = get(value, key) orelse return null;
-    return if (value_at_key == .integer) value_at_key.integer else null;
-}
-
-pub fn jsonString(allocator: Allocator, value: Value) ![]u8 {
-    var output: Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try std.json.Stringify.value(value, .{}, &output.writer);
-    return output.toOwnedSlice();
-}
-
-fn displayScalar(allocator: Allocator, value: Value) ![]const u8 {
-    return if (value == .string) value.string else jsonString(allocator, value);
 }
 
 const TestClient = struct {
