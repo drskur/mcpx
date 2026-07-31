@@ -530,3 +530,80 @@ test "negotiated legacy session is sent after initialize" {
     try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(1), "Mcp-Session-Id") == null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(2), "Mcp-Session-Id: legacy-session") != null);
 }
+
+test "legacy discover rejection initializes and supports a search call" {
+    const test_http = @import("test_http.zig");
+    for ([_][]const u8{ "404 Not Found", "405 Method Not Allowed" }) |probe_status| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const io = std.testing.io;
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var server = try address.listen(io, .{ .reuse_address = true });
+        defer server.deinit(io);
+        const endpoint = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()});
+        var script = test_http.Script{ .responses = &.{
+            .{ .status = probe_status, .body = "{\"error\":\"not_found\"}" },
+            .{
+                .status = "200 OK",
+                .extra_headers = "Mcp-Session-Id: search-session\r\n",
+                .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"search\",\"version\":\"1\"}}}",
+            },
+            .{ .status = "202 Accepted", .body = "" },
+            .{ .status = "200 OK", .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}" },
+        } };
+        var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+        var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+        defer client.deinit();
+
+        try client.connect();
+        var params = Value{ .object = .empty };
+        try params.object.put(arena.allocator(), "name", .{ .string = "search" });
+        try params.object.put(arena.allocator(), "arguments", .{ .object = .empty });
+        const result = try client.rpc("tools/call", params);
+        try serving.await(io);
+
+        try std.testing.expectEqualStrings("2025-03-26", client.negotiated_version);
+        try std.testing.expect(rpc_module.get(result, "content").? == .array);
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(3), "Mcp-Session-Id: search-session") != null);
+    }
+}
+
+test "session-expiring 404 reconnects and retries the request" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()});
+    const initialized =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"legacy\",\"version\":\"1\"}}}";
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = "404 Not Found", .body = "" },
+        .{ .status = "200 OK", .extra_headers = "Mcp-Session-Id: old-session\r\n", .body = initialized },
+        .{ .status = "202 Accepted", .body = "" },
+        .{ .status = "404 Not Found", .body = "{\"error\":\"session_expired\"}" },
+        .{ .status = "404 Not Found", .body = "" },
+        .{
+            .status = "200 OK",
+            .extra_headers = "Mcp-Session-Id: new-session\r\n",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"legacy\",\"version\":\"1\"}}}",
+        },
+        .{ .status = "202 Accepted", .body = "" },
+        .{ .status = "200 OK", .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    const tools = try client.listTools();
+    try serving.await(io);
+
+    try std.testing.expectEqual(@as(usize, 0), tools.len);
+    try std.testing.expectEqualStrings("new-session", client.session_id.?);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(3), "Mcp-Session-Id: old-session") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(4), "Mcp-Session-Id") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(7), "Mcp-Session-Id: new-session") != null);
+}
