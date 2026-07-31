@@ -10,6 +10,7 @@ const transport = @import("transport.zig");
 const oauth_module = @import("oauth.zig");
 const protocol = @import("protocol.zig");
 const build_info = @import("build_info");
+const test_http = @import("test_http.zig");
 const diagnostics_out = @import("diagnostics.zig");
 
 const version = build_info.version;
@@ -505,7 +506,6 @@ fn requestName(params: ?Value) ?[]const u8 {
 }
 
 fn expectConnectHttpFailure(status: []const u8, body: []const u8, expected: anyerror) !void {
-    const test_http = @import("test_http.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -696,7 +696,6 @@ test "connect does not downgrade after HTTP 403" {
 }
 
 test "connect negotiates recognized HTTP 400 unsupported-version response" {
-    const test_http = @import("test_http.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -730,7 +729,6 @@ test "connect negotiates recognized HTTP 400 unsupported-version response" {
 }
 
 test "negotiated legacy session is sent after initialize" {
-    const test_http = @import("test_http.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -767,7 +765,6 @@ test "negotiated legacy session is sent after initialize" {
 }
 
 test "legacy discover rejection initializes and supports a search call" {
-    const test_http = @import("test_http.zig");
     for ([_][]const u8{ "404 Not Found", "405 Method Not Allowed" }) |probe_status| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -804,7 +801,6 @@ test "legacy discover rejection initializes and supports a search call" {
 }
 
 test "session-expiring 404 reconnects and retries the request" {
-    const test_http = @import("test_http.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -863,4 +859,184 @@ test "configured header names and values reject request smuggling" {
     try std.testing.expect(isValidHeaderValue("plain value"));
     try std.testing.expect(!isValidHeaderValue("value\r\nX-Injected: 1"));
     try std.testing.expect(!isValidHeaderValue("tab\tvalue"));
+}
+
+fn discoverAndListScript(comptime tools_body: []const u8) [2]test_http.Response {
+    return .{
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+        .{ .status = "200 OK", .body = tools_body },
+    };
+}
+
+test "a keep-alive connection serves discovery and tool listing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    const responses = discoverAndListScript(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"search\",\"description\":\"find\"}]}}",
+    );
+    var script = test_http.Script{ .responses = &responses, .keep_alive = true };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    const tools = try client.listTools();
+    try serving.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), tools.len);
+    try std.testing.expectEqualStrings("search", tools[0].name().?);
+}
+
+test "an SSE response is parsed through the real transport" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+        .{
+            .status = "200 OK",
+            .content_type = "text/event-stream; charset=utf-8",
+            .body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"notifications/progress\"}\n\n" ++
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n",
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    var params = Value{ .object = .empty };
+    try params.object.put(arena.allocator(), "name", .{ .string = "search" });
+    try params.object.put(arena.allocator(), "arguments", .{ .object = .empty });
+    const result = try client.rpc("tools/call", params);
+    try serving.await(io);
+
+    const content = rpc_module.get(result, "content").?;
+    try std.testing.expectEqualStrings("ok", rpc_module.getString(content.array.items[0], "text").?);
+}
+
+test "tool parameter headers reach the wire for annotated arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+        .{
+            .status = "200 OK",
+            .body =
+            \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","inputSchema":{"type":"object","properties":{"tenant":{"type":"string","x-mcp-header":"Tenant"}}}}]}}
+            ,
+        },
+        .{ .status = "200 OK", .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.listTools();
+    var params = Value{ .object = .empty };
+    try params.object.put(arena.allocator(), "name", .{ .string = "search" });
+    var call_args = Value{ .object = .empty };
+    try call_args.object.put(arena.allocator(), "tenant", .{ .string = "acme" });
+    try params.object.put(arena.allocator(), "arguments", call_args);
+    _ = try client.rpc("tools/call", params);
+    try serving.await(io);
+
+    const call_request = script.request(2);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(call_request, "Mcp-Param-Tenant: acme") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(call_request, "Mcp-Name: search") != null);
+}
+
+test "a stalled server hits the configured timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    var serving = try io.concurrent(test_http.serveStalled, .{ io, &server });
+    defer serving.cancel(io) catch {};
+    var client = McpClient.init(arena.allocator(), io, .{
+        .name = "test",
+        .endpoint = endpoint,
+        .timeout_secs = 1,
+    }, "unused");
+    defer client.deinit();
+
+    try std.testing.expectError(error.RequestTimedOut, client.connect());
+}
+
+test "a JSON-RPC error is reported as a diagnostic on the client" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"unknown tool\"}}",
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    var params = Value{ .object = .empty };
+    try params.object.put(arena.allocator(), "name", .{ .string = "nope" });
+    try params.object.put(arena.allocator(), "arguments", .{ .object = .empty });
+    try std.testing.expectError(error.JsonRpcError, client.rpc("tools/call", params));
+    try serving.await(io);
+
+    try std.testing.expectEqual(@as(i64, -32602), client.last_rpc_error.?.code);
+    try std.testing.expectEqualStrings("unknown tool", client.last_rpc_error.?.message);
+}
+
+test "unnamed and duplicate tools are skipped while listing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(arena.allocator(), &server);
+    const responses = discoverAndListScript(
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"no name"},{"name":"search"},{"name":"search","description":"duplicate"}]}}
+    );
+    var script = test_http.Script{ .responses = &responses };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try client.connect();
+    const tools = try client.listTools();
+    try serving.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), tools.len);
+    try std.testing.expectEqualStrings("search", tools[0].name().?);
 }

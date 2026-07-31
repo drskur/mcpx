@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check src build.zig
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Smoke test the CLI
+        run: |
+          printf '[[http]]\nname = "demo"\nendpoint = "https://mcp.example/mcp"\n' > config.toml
+          ./zig-out/bin/mcpx --help
+          ./zig-out/bin/mcpx -c config.toml servers
+          # An unknown server is a configuration error: exit code 2.
+          if ./zig-out/bin/mcpx -c config.toml list missing; then exit 1; fi
+          ./zig-out/bin/mcpx -c config.toml list missing || test $? -eq 2

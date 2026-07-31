@@ -745,3 +745,91 @@ test "authorization URL and token forms carry the canonical resource" {
     try std.testing.expect(std.mem.indexOf(u8, url, "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "MCP.EXAMPLE") == null);
 }
+
+test "a stored refresh token is exchanged over real HTTP and persisted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const test_http = @import("test_http.zig");
+
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const origin = try test_http.originFor(allocator, &server);
+    const endpoint = try test_http.endpointFor(allocator, &server);
+    const resource = try canonicalResourceUri(allocator, endpoint);
+
+    const responses = [_]test_http.Response{
+        .{ .status = "200 OK", .body = try std.fmt.allocPrint(allocator,
+            \\{{"resource":"{s}","authorization_servers":["{s}"]}}
+        , .{ resource, origin }) },
+        .{ .status = "200 OK", .body = try std.fmt.allocPrint(allocator,
+            \\{{"issuer":"{s}","authorization_endpoint":"{s}/authorize","token_endpoint":"{s}/token"}}
+        , .{ origin, origin, origin }) },
+        .{ .status = "200 OK", .body =
+        \\{"access_token":"fresh-access","refresh_token":"fresh-refresh","token_type":"Bearer","expires_in":3600}
+        },
+    };
+    var script = test_http.Script{ .responses = &responses };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+
+    const token_path = try std.fmt.allocPrint(allocator, "/tmp/mcpx-token-test-{d}.toml", .{server.socket.address.getPort()});
+    defer std.Io.Dir.cwd().deleteFile(io, token_path) catch {};
+    var seeded: TokenStore = .empty;
+    try seeded.put(allocator, try tokenKey(allocator, origin, resource), .{
+        .issuer = origin,
+        .resource = resource,
+        .access_token = "stale-access",
+        .refresh_token = "stored-refresh",
+        .expires_at = unixNow(io) - 10,
+        .client_id = "cli-client",
+    });
+    try saveTokens(io, allocator, token_path, seeded);
+
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const token = try ensureToken(allocator, io, &http, endpoint, .{ .client_id = "cli-client" }, token_path);
+    try serving.await(io);
+
+    try std.testing.expectEqualStrings("fresh-access", token.access_token);
+    try std.testing.expectEqualStrings("fresh-refresh", token.refresh_token.?);
+    try std.testing.expectEqualStrings(resource, token.resource.?);
+    try std.testing.expect(token.expires_at.? > unixNow(io));
+
+    var reloaded = try loadTokens(io, allocator, token_path);
+    defer reloaded.deinit(allocator);
+    const stored = reloaded.get(try tokenKey(allocator, origin, resource)).?;
+    try std.testing.expectEqualStrings("fresh-access", stored.access_token);
+    try std.testing.expectEqualStrings("cli-client", stored.client_id.?);
+
+    // The protected resource document is fetched from the endpoint path first.
+    try std.testing.expect(std.mem.indexOf(u8, script.request(0), "/.well-known/oauth-protected-resource/mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script.request(1), "/.well-known/oauth-authorization-server") != null);
+    try std.testing.expect(std.mem.startsWith(u8, script.request(2), "POST /token"));
+}
+
+test "OAuth error bodies are surfaced instead of a bare HTTP failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const test_http = @import("test_http.zig");
+
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(allocator, "{s}/token", .{try test_http.originFor(allocator, &server)});
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = "400 Bad Request", .body =
+        \\{"error":"invalid_grant","error_description":"refresh token expired"}
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+
+    try std.testing.expectError(
+        error.OauthHttpRequestFailed,
+        fetchJson(allocator, &http, .POST, url, "grant_type=refresh_token", &.{}),
+    );
+    try serving.await(io);
+}

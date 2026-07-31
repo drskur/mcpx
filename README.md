@@ -15,7 +15,8 @@ The executable is written to `zig-out/bin/mcpx`.
 
 ## Configuration
 
-Create `~/.config/mcpx/config.toml`:
+Create `$XDG_CONFIG_HOME/mcpx/config.toml`, or `~/.config/mcpx/config.toml`
+when `XDG_CONFIG_HOME` is unset:
 
 ```toml
 [[http]]
@@ -33,24 +34,38 @@ scopes = "repo read"          # optional, space-separated
 register = true               # RFC 7591 dynamic client registration
 ```
 
-The default timeout is 30 seconds. Pass `-c <path>` to use another
-configuration file.
+The default timeout is 30 seconds; `timeout_secs = 0` is rejected. Pass
+`-c <path>` or `--config=<path>` to use another configuration file. Server
+entries are validated before any request: names must be unique and non-empty,
+endpoints must be absolute `http`/`https` URIs, and configured header names and
+values must be valid HTTP field content.
 
 For an OAuth-configured server, mcpx honors `WWW-Authenticate`
 `resource_metadata` challenges or RFC 9728 protected-resource discovery, then
-tries RFC 8414 Authorization Server Metadata and OIDC Discovery. It uses
-Authorization Code with PKCE (S256), opens
-the authorization URL with `xdg-open` on Linux, and waits for one redirect to
-an ephemeral `127.0.0.1` callback port. The URL is always printed to stderr so
-it can be opened manually. The callback state and authorization-server `iss`
-(when supplied or required) are verified before code exchange. Both
-authorization-code and refresh grants include the MCP endpoint as RFC 8707
-`resource`.
+tries RFC 8414 Authorization Server Metadata and OIDC Discovery. A challenge
+metadata URL is only followed when it stays on the resource server's own
+origin, and every advertised authorization server is tried in order. Issuer,
+authorization, token and registration URLs must use `https`, except on loopback
+hosts.
+
+mcpx uses Authorization Code with PKCE (S256), opens the authorization URL with
+`xdg-open` on Linux, and waits up to 300 seconds for a redirect to an ephemeral
+`127.0.0.1` callback port. Other requests on that port, such as a browser
+favicon fetch, are answered and ignored. The URL is always printed to stderr so
+it can be opened manually. The callback state is compared in constant time, an
+`error=` response is reported with its description, and the
+authorization-server `iss` (when supplied or required) is verified before code
+exchange. Both authorization-code and refresh grants include the canonical MCP
+endpoint as RFC 8707 `resource`.
+
+Dynamic registration (`register = true`) registers a public native client with
+`token_endpoint_auth_method: none`, so no client secret has to be stored.
 
 Tokens and dynamically registered client credentials are keyed by validated
 issuer and stored separately in
-`~/.config/mcpx/tokens.toml`. The file is atomically replaced with owner-only
-`0600` permissions after grants and refreshes. Access tokens are refreshed when
+`<config dir>/mcpx/tokens.toml`. The directory is created with `0700` and the
+file is atomically replaced with owner-only `0600` permissions after grants and
+refreshes. Access tokens are refreshed when
 they are expired or within 60 seconds of expiry. To discard the effective
 session and force a new browser authorization, run:
 
@@ -72,7 +87,25 @@ mcpx call <server> <tool> [json_args]
 mcpx skills <server> [tool]
 ```
 
-`mcpx servers` appends `[oauth]` to OAuth-enabled entries. `mcpx` negotiates
+`mcpx servers` appends `[oauth]` to OAuth-enabled entries. Unknown options are
+rejected rather than being treated as arguments.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Unclassified failure |
+| `2` | Usage or configuration error, including an unknown server or tool |
+| `3` | Authentication or authorization failure |
+| `4` | Protocol or JSON-RPC failure |
+| `5` | Request timeout |
+| `6` | The tool ran and reported `isError` |
+| `7` | The tool needs more input (`resultType: input_required`) |
+
+A JSON-RPC error is reported on stderr with its `code`, `message` and `data`.
+
+ `mcpx` negotiates
 MCP `2026-07-28` with `server/discover` and remains compatible with legacy
 `2025-03-26` initialize/session servers. It supports JSON and SSE responses and
 follows all `tools/list` pagination cursors.
@@ -88,5 +121,16 @@ the newest mutual version, and falls back to legacy initialize when
 For `2026-07-28`, requests include protocol/client `_meta`, `Mcp-Method`, and
 `Mcp-Name` where applicable. Modern requests do not use MCP sessions or legacy
 cancellation notifications. A result with `resultType: input_required` is
-returned intact; mcpx does not yet conduct that follow-up interaction
-automatically.
+printed intact and reported with exit code 7; mcpx does not yet conduct that
+follow-up interaction automatically.
+
+## Development
+
+```sh
+zig build test          # 105 tests, including loopback HTTP integration tests
+zig fmt --check src build.zig
+```
+
+Tool listings skip entries without a name and duplicate names, tool schema
+rendering is depth bounded, and responses are capped at 16 MiB (1 MiB for OAuth
+metadata) so a hostile server cannot exhaust memory.

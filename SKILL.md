@@ -5,9 +5,11 @@ Use mcpx to discover and invoke tools exposed by Model Context Protocol (MCP) HT
 ## Prerequisites
 
 - `mcpx` binary on `PATH` (build it from this repository with `zig build -Doptimize=ReleaseFast`)
-- A config file at `~/.config/mcpx/config.toml`, or a path supplied with `-c PATH` / `--config PATH`
+- A config file at `$XDG_CONFIG_HOME/mcpx/config.toml`, or a path supplied with `-c PATH`, `--config PATH` or `--config=PATH`
 
-Without an explicit config path, mcpx requires `HOME` and reads `$HOME/.config/mcpx/config.toml`.
+Without an explicit config path, mcpx reads `$XDG_CONFIG_HOME/mcpx/config.toml`, falling back to `$HOME/.config/mcpx/config.toml`.
+
+Exit codes: `2` usage or configuration, `3` authentication, `4` protocol or JSON-RPC, `5` timeout, `6` the tool reported `isError`, `7` the tool needs more input.
 
 ## Config Format
 

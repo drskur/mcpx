@@ -140,15 +140,20 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
         try out.print("authenticated {s}\n", .{server.name});
         return;
     }
+    // Arguments are validated before a connection is opened so that a typo in
+    // the JSON fails immediately and without any network traffic.
+    const call_args: ?Value = if (std.mem.eql(u8, parsed.command, "call")) blk: {
+        const args_text = if (parsed.positionals_len > 2) parsed.positionals[2] else "{}";
+        const value = std.json.parseFromSliceLeaky(Value, allocator, args_text, .{}) catch return error.ArgsNotValidJson;
+        if (value != .object) return error.ArgsMustBeObject;
+        break :blk value;
+    } else null;
     try client.connect();
 
-    if (std.mem.eql(u8, parsed.command, "call")) {
-        const args_text = if (parsed.positionals_len > 2) parsed.positionals[2] else "{}";
-        const call_args = std.json.parseFromSliceLeaky(Value, allocator, args_text, .{}) catch return error.ArgsNotValidJson;
-        if (call_args != .object) return error.ArgsMustBeObject;
+    if (call_args) |arguments| {
         var params = Value{ .object = .empty };
         try params.object.put(allocator, "name", .{ .string = parsed.positionals[1] });
-        try params.object.put(allocator, "arguments", call_args);
+        try params.object.put(allocator, "arguments", arguments);
         const outcome = client.rpcOutcome("tools/call", params) catch |err| return reportRpcFailure(&client, err);
         const result = switch (outcome) {
             .complete => |value| value,
@@ -296,4 +301,139 @@ test "tool results that report failure are detected" {
     try std.testing.expect(isToolError(failed));
     try std.testing.expect(!isToolError(ok));
     try std.testing.expect(!isToolError(not_a_bool));
+}
+
+fn runCommandForTest(allocator: Allocator, io: Io, args: []const []const u8, config: Config, out: *Io.Writer) !void {
+    const parsed = try cli.parseArgs(args);
+    return runCommand(allocator, io, parsed, config, "unused", out);
+}
+
+test "the servers command lists configured entries and marks OAuth" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(arena.allocator());
+    try runCommandForTest(arena.allocator(), std.testing.io, &.{ "mcpx", "servers" }, .{ .http = &.{
+        .{ .name = "plain", .endpoint = "https://one.example/mcp" },
+        .{ .name = "secured", .endpoint = "https://two.example/mcp", .oauth = .{ .client_id = "id" } },
+    } }, &output.writer);
+    try std.testing.expectEqualStrings(
+        "plain\thttps://one.example/mcp\nsecured\thttps://two.example/mcp [oauth]\n",
+        output.written(),
+    );
+}
+
+test "the servers command reports an empty configuration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(arena.allocator());
+    try runCommandForTest(arena.allocator(), std.testing.io, &.{ "mcpx", "servers" }, .{}, &output.writer);
+    try std.testing.expectEqualStrings("no servers configured.\n", output.written());
+}
+
+test "an unknown server name fails before any request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(arena.allocator());
+    try std.testing.expectError(error.ServerNotFound, runCommandForTest(
+        arena.allocator(),
+        std.testing.io,
+        &.{ "mcpx", "list", "missing" },
+        .{ .http = &.{.{ .name = "present", .endpoint = "https://one.example/mcp" }} },
+        &output.writer,
+    ));
+}
+
+test "the list and skills commands render a live server" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const test_http = @import("test_http.zig");
+    const tools_body =
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"Find things\nsecond line","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"text"}},"required":["query"]}}]}}
+    ;
+    const discovery = test_http.Response{
+        .status = "200 OK",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+    };
+
+    for ([_][]const u8{ "list", "skills" }) |command| {
+        var server = try test_http.listenLoopback(io);
+        defer server.deinit(io);
+        const endpoint = try test_http.endpointFor(allocator, &server);
+        var script = test_http.Script{ .responses = &.{ discovery, .{ .status = "200 OK", .body = tools_body } } };
+        var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+        var output: Io.Writer.Allocating = .init(allocator);
+        try runCommandForTest(
+            allocator,
+            io,
+            &.{ "mcpx", command, "demo" },
+            .{ .http = &.{.{ .name = "demo", .endpoint = endpoint }} },
+            &output.writer,
+        );
+        try serving.await(io);
+        if (std.mem.eql(u8, command, "list")) {
+            // Only the first line of a description belongs in the listing.
+            try std.testing.expectEqualStrings("search\tFind things\n", output.written());
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, output.written(), "## search\n"));
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "**(required)**") != null);
+        }
+    }
+}
+
+test "a failing tool call prints the result and reports a tool error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const test_http = @import("test_http.zig");
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const endpoint = try test_http.endpointFor(allocator, &server);
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "200 OK",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"tools\":{}}}}",
+        },
+        .{
+            .status = "200 OK",
+            .body =
+            \\{"jsonrpc":"2.0","id":2,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}
+            ,
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var output: Io.Writer.Allocating = .init(allocator);
+    try std.testing.expectError(error.ToolExecutionFailed, runCommandForTest(
+        allocator,
+        io,
+        &.{ "mcpx", "call", "demo", "search", "{\"query\":\"x\"}" },
+        .{ .http = &.{.{ .name = "demo", .endpoint = endpoint }} },
+        &output.writer,
+    ));
+    try serving.await(io);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"boom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script.request(1), "Mcp-Method: tools/call") != null);
+}
+
+test "call arguments must be a JSON object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output: Io.Writer.Allocating = .init(arena.allocator());
+    const config: Config = .{ .http = &.{.{ .name = "demo", .endpoint = "https://one.example/mcp" }} };
+    try std.testing.expectError(error.ArgsNotValidJson, runCommandForTest(
+        arena.allocator(),
+        std.testing.io,
+        &.{ "mcpx", "call", "demo", "search", "not json" },
+        config,
+        &output.writer,
+    ));
+    try std.testing.expectError(error.ArgsMustBeObject, runCommandForTest(
+        arena.allocator(),
+        std.testing.io,
+        &.{ "mcpx", "call", "demo", "search", "[1,2]" },
+        config,
+        &output.writer,
+    ));
 }

@@ -143,10 +143,14 @@ fn readCallbackRequest(allocator: Allocator, io: Io, stream: std.Io.net.Stream) 
     var read_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     const line = try reader.interface.takeDelimiterExclusive('\n');
+    reader.interface.toss(1);
     const request = try parseCallbackRequestLine(allocator, std.mem.trimEnd(u8, line, "\r"));
+    // `takeDelimiterExclusive` leaves the newline, so it is tossed explicitly
+    // to drain the remaining headers rather than reading empty lines.
     while (true) {
         const header = reader.interface.takeDelimiterExclusive('\n') catch break;
-        if (std.mem.trim(u8, header, "\r").len == 0) break;
+        reader.interface.toss(1);
+        if (std.mem.trimEnd(u8, header, "\r").len == 0) break;
     }
     return request;
 }
