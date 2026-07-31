@@ -345,6 +345,7 @@ pub const McpClient = struct {
 
     pub fn listTools(self: *McpClient) ![]const Tool {
         if (!self.supports_tools) return error.ServerDoesNotSupportTools;
+        self.tool_header_mappings.clearRetainingCapacity();
         var tools: std.ArrayList(Tool) = .empty;
         var seen_cursors: std.StringHashMapUnmanaged(void) = .empty;
         defer seen_cursors.deinit(self.allocator);

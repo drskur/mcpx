@@ -39,7 +39,6 @@ const Metadata = struct {
     authorization_endpoint: []const u8,
     token_endpoint: []const u8,
     registration_endpoint: ?[]const u8 = null,
-    authorization_response_iss_parameter_supported: bool = false,
 };
 
 pub const OauthChallenge = struct {
@@ -197,7 +196,7 @@ fn authenticateAndStore(
     const received = try acceptCallback(allocator, io, &callback_server);
     if (state.len != received.state.len or !std.crypto.timing_safe.eql([32]u8, fixedState(state), fixedState(received.state)))
         return error.OauthStateMismatch;
-    try validateAuthorizationIssuer(metadata.issuer, metadata.authorization_response_iss_parameter_supported, received.issuer);
+    try validateAuthorizationIssuer(metadata.issuer, received.issuer);
     const response = try exchangeCode(allocator, http, metadata.token_endpoint, received.code, verifier, redirect_uri, actual_client_id, client_secret, endpoint);
     const resource = try canonicalResourceUri(allocator, endpoint);
     const token = tokenFromResponse(response, metadata.issuer, resource, actual_client_id, client_secret, unixNow(io));
@@ -222,15 +221,10 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     try candidates.appendSlice(allocator, &fallback_candidates);
     for (candidates.items) |url| {
         const value = fetchJson(allocator, http, .GET, url, null, discovery_headers) catch continue;
-        if (rpc.getString(value, "resource")) |resource|
-            if (!std.mem.eql(u8, resource, endpoint)) return error.OauthResourceMismatch;
-        if (rpc.getString(value, "authorization_server")) |server| authorization_server = server;
-        if (value == .object) if (value.object.get("authorization_servers")) |servers| {
-            if (servers == .array and servers.array.items.len > 0 and servers.array.items[0] == .string)
-                authorization_server = servers.array.items[0].string;
-        };
+        authorization_server = try validateProtectedResourceMetadata(allocator, value, endpoint);
+        break;
     }
-    const issuer = authorization_server orelse origin;
+    const issuer = authorization_server orelse return error.OauthProtectedResourceMetadataDiscoveryFailed;
     const metadata_urls = try authorizationMetadataUrls(allocator, issuer);
     for (metadata_urls) |metadata_url| {
         const value = fetchJson(allocator, http, .GET, metadata_url, null, discovery_headers) catch continue;
@@ -248,7 +242,6 @@ fn metadataFromJson(value: Value, expected_issuer: []const u8, resource: []const
         .authorization_endpoint = rpc.getString(value, "authorization_endpoint") orelse return error.OauthMetadataMissingAuthorizationEndpoint,
         .token_endpoint = rpc.getString(value, "token_endpoint") orelse return error.OauthMetadataMissingTokenEndpoint,
         .registration_endpoint = rpc.getString(value, "registration_endpoint"),
-        .authorization_response_iss_parameter_supported = getBool(value, "authorization_response_iss_parameter_supported") orelse false,
     };
 }
 
@@ -366,7 +359,10 @@ fn canonicalResourceUri(allocator: Allocator, input: []const u8) ![]const u8 {
         .fragment = false,
         .port = true,
     });
-    return output.toOwnedSlice();
+    const canonical = try output.toOwnedSlice();
+    if (uri.path.isEmpty() and uri.query == null and canonical.len > 0 and canonical[canonical.len - 1] == '/')
+        return canonical[0 .. canonical.len - 1];
+    return canonical;
 }
 
 fn openBrowser(io: Io, url: []const u8) void {
@@ -405,19 +401,35 @@ fn authorizationMetadataUrls(allocator: Allocator, issuer: []const u8) ![]const 
     try urls.append(allocator, if (path.len == 0)
         try std.fmt.allocPrint(allocator, "{s}/.well-known/openid-configuration", .{origin})
     else
-        try std.fmt.allocPrint(allocator, "{s}/{s}/.well-known/openid-configuration", .{ origin, path }));
+        try std.fmt.allocPrint(allocator, "{s}/.well-known/openid-configuration/{s}", .{ origin, path }));
+    if (path.len != 0) try urls.append(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}/.well-known/openid-configuration", .{ origin, path }));
     return urls.toOwnedSlice(allocator);
 }
 
-pub fn validateAuthorizationIssuer(expected: []const u8, required: bool, received: ?[]const u8) !void {
-    if (received) |issuer| {
-        if (!std.mem.eql(u8, expected, issuer)) return error.OauthAuthorizationIssuerMismatch;
-    } else if (required) return error.OauthAuthorizationIssuerMissing;
+pub fn validateAuthorizationIssuer(expected: []const u8, received: ?[]const u8) !void {
+    const issuer = received orelse return error.OauthAuthorizationIssuerMissing;
+    if (!std.mem.eql(u8, expected, issuer)) return error.OauthAuthorizationIssuerMismatch;
 }
 
-fn getBool(value: Value, key: []const u8) ?bool {
-    const field = rpc.get(value, key) orelse return null;
-    return if (field == .bool) field.bool else null;
+fn validateProtectedResourceMetadata(allocator: Allocator, value: Value, endpoint: []const u8) ![]const u8 {
+    if (value != .object) return error.OauthProtectedResourceMetadataMustBeObject;
+    const resource = rpc.getString(value, "resource") orelse return error.OauthProtectedResourceMetadataMissingResource;
+    const expected_resource = try canonicalResourceUri(allocator, endpoint);
+    const actual_resource = try canonicalResourceUri(allocator, resource);
+    if (!std.mem.eql(u8, expected_resource, actual_resource)) return error.OauthResourceMismatch;
+    const servers = rpc.get(value, "authorization_servers") orelse
+        return error.OauthProtectedResourceMetadataMissingAuthorizationServers;
+    if (servers != .array or servers.array.items.len == 0)
+        return error.OauthProtectedResourceMetadataMissingAuthorizationServers;
+    for (servers.array.items) |server| {
+        if (server != .string or server.string.len == 0)
+            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
+        const issuer = std.Uri.parse(server.string) catch
+            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
+        if (issuer.host == null or issuer.fragment != null)
+            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
+    }
+    return servers.array.items[0].string;
 }
 
 fn fetchJson(allocator: Allocator, http: *std.http.Client, method: std.http.Method, url: []const u8, payload: ?[]const u8, headers: []const std.http.Header) !Value {
@@ -470,11 +482,10 @@ fn unixNow(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
-test "authorization response issuer is exact and required when advertised" {
-    try validateAuthorizationIssuer("https://issuer.example", true, "https://issuer.example");
-    try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", false, "https://other.example"));
-    try std.testing.expectError(error.OauthAuthorizationIssuerMissing, validateAuthorizationIssuer("https://issuer.example", true, null));
-    try validateAuthorizationIssuer("https://issuer.example", false, null);
+test "authorization response issuer is always exact and required" {
+    try validateAuthorizationIssuer("https://issuer.example", "https://issuer.example");
+    try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", "https://other.example"));
+    try std.testing.expectError(error.OauthAuthorizationIssuerMissing, validateAuthorizationIssuer("https://issuer.example", null));
 }
 
 test "WWW-Authenticate parser preserves resource metadata and scope" {
@@ -490,7 +501,59 @@ test "authorization metadata well-known URLs preserve issuer paths" {
     defer arena.deinit();
     const urls = try authorizationMetadataUrls(arena.allocator(), "https://issuer.example/tenant/a");
     try std.testing.expectEqualStrings("https://issuer.example/.well-known/oauth-authorization-server/tenant/a", urls[0]);
-    try std.testing.expectEqualStrings("https://issuer.example/tenant/a/.well-known/openid-configuration", urls[1]);
+    try std.testing.expectEqualStrings("https://issuer.example/.well-known/openid-configuration/tenant/a", urls[1]);
+    try std.testing.expectEqualStrings("https://issuer.example/tenant/a/.well-known/openid-configuration", urls[2]);
+}
+
+test "protected resource metadata requires resource binding and authorization servers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const endpoint = "https://mcp.example/mcp";
+    const non_object = try std.json.parseFromSliceLeaky(Value, allocator, "[]", .{});
+    try std.testing.expectError(
+        error.OauthProtectedResourceMetadataMustBeObject,
+        validateProtectedResourceMetadata(allocator, non_object, endpoint),
+    );
+    const valid = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"resource":"HTTPS://MCP.EXAMPLE:443/mcp","authorization_servers":["https://issuer.example"]}
+    , .{});
+    try std.testing.expectEqualStrings(
+        "https://issuer.example",
+        try validateProtectedResourceMetadata(allocator, valid, endpoint),
+    );
+    const missing_resource = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"authorization_servers":["https://issuer.example"]}
+    , .{});
+    try std.testing.expectError(
+        error.OauthProtectedResourceMetadataMissingResource,
+        validateProtectedResourceMetadata(allocator, missing_resource, endpoint),
+    );
+    const mismatch = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"resource":"https://other.example/mcp","authorization_servers":["https://issuer.example"]}
+    , .{});
+    try std.testing.expectError(error.OauthResourceMismatch, validateProtectedResourceMetadata(allocator, mismatch, endpoint));
+    const missing_servers = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"resource":"https://mcp.example/mcp"}
+    , .{});
+    try std.testing.expectError(
+        error.OauthProtectedResourceMetadataMissingAuthorizationServers,
+        validateProtectedResourceMetadata(allocator, missing_servers, endpoint),
+    );
+    const empty_servers = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"resource":"https://mcp.example/mcp","authorization_servers":[]}
+    , .{});
+    try std.testing.expectError(
+        error.OauthProtectedResourceMetadataMissingAuthorizationServers,
+        validateProtectedResourceMetadata(allocator, empty_servers, endpoint),
+    );
+    const invalid_server = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"resource":"https://mcp.example/mcp","authorization_servers":["relative"]}
+    , .{});
+    try std.testing.expectError(
+        error.OauthProtectedResourceMetadataInvalidAuthorizationServer,
+        validateProtectedResourceMetadata(allocator, invalid_server, endpoint),
+    );
 }
 
 test "authorization and refresh token forms include resource" {
