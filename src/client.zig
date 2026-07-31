@@ -364,6 +364,32 @@ fn requestName(params: ?Value) ?[]const u8 {
     return rpc_module.getString(value, "name") orelse rpc_module.getString(value, "uri");
 }
 
+fn expectConnectHttpFailure(status: []const u8, body: []const u8, expected: anyerror) !void {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        arena.allocator(),
+        "http://127.0.0.1:{d}/mcp",
+        .{server.socket.address.getPort()},
+    );
+    var script = test_http.Script{ .responses = &.{
+        .{ .status = status, .body = body },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
+    defer client.deinit();
+
+    try std.testing.expectError(expected, client.connect());
+    try serving.await(io);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(0), "MCP-Protocol-Version: 2026-07-28") != null);
+    try std.testing.expectEqual(@as(usize, 0), script.request_lengths[1]);
+}
+
 test "initialization requires serverInfo version" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -411,53 +437,27 @@ test "resultType supports complete input-required and legacy omission" {
 }
 
 test "connect does not downgrade after HTTP 500" {
-    const test_http = @import("test_http.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const io = std.testing.io;
-    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    const endpoint = try std.fmt.allocPrint(
-        arena.allocator(),
-        "http://127.0.0.1:{d}/mcp",
-        .{server.socket.address.getPort()},
+    try expectConnectHttpFailure(
+        "500 Internal Server Error",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        error.HttpServerError,
     );
-    var script = test_http.Script{ .responses = &.{
-        .{ .status = "500 Internal Server Error", .content_type = "text/plain", .body = "temporary failure" },
-    } };
-    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
-    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
-    defer client.deinit();
-
-    try std.testing.expectError(error.HttpServerError, client.connect());
-    try serving.await(io);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(0), "MCP-Protocol-Version: 2026-07-28") != null);
 }
 
 test "connect does not downgrade after HTTP 429" {
-    const test_http = @import("test_http.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const io = std.testing.io;
-    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    const endpoint = try std.fmt.allocPrint(
-        arena.allocator(),
-        "http://127.0.0.1:{d}/mcp",
-        .{server.socket.address.getPort()},
+    try expectConnectHttpFailure(
+        "429 Too Many Requests",
+        "{\"error\":\"rate_limited\"}",
+        error.HttpRateLimited,
     );
-    var script = test_http.Script{ .responses = &.{
-        .{ .status = "429 Too Many Requests", .content_type = "text/plain", .body = "slow down" },
-    } };
-    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
-    var client = McpClient.init(arena.allocator(), io, .{ .name = "test", .endpoint = endpoint }, "unused");
-    defer client.deinit();
+}
 
-    try std.testing.expectError(error.HttpRateLimited, client.connect());
-    try serving.await(io);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(script.request(0), "MCP-Protocol-Version: 2026-07-28") != null);
+test "connect does not downgrade after HTTP 403" {
+    try expectConnectHttpFailure(
+        "403 Forbidden",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        error.HttpForbidden,
+    );
 }
 
 test "connect negotiates recognized HTTP 400 unsupported-version response" {

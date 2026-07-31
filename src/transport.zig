@@ -85,7 +85,6 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
             break;
         };
     }
-    if (sent_session and status == .not_found) return error.SessionExpired;
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
@@ -107,13 +106,24 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     if (output.written().len > max_response_size) return error.ResponseTooLarge;
     const text = output.written();
     const is_json = std.ascii.eqlIgnoreCase(base_type, "application/json");
-    if (is_json) if (expected_id) |id| {
-        self.server_supported_versions = try rpc.supportedVersionsFromError(self.allocator, text, id);
-        if (status.class() != .success) {
-            _ = rpc.parseRpc(self.allocator, text, id) catch |err| return err;
-        }
-    };
     if (status.class() != .success) {
+        // HTTP status controls failures except for the protocol negotiation
+        // response. In particular, arbitrary JSON-RPC errors and malformed
+        // JSON must not turn 401/403/429/5xx responses into RPC errors.
+        if (is_json) if (expected_id) |id| {
+            const supported = rpc.supportedVersionsFromError(self.allocator, text, id) catch null;
+            if (supported) |versions| {
+                _ = rpc.parseRpc(self.allocator, text, id) catch |err| {
+                    if (err == error.UnsupportedProtocolVersionError) {
+                        self.server_supported_versions = versions;
+                        return err;
+                    }
+                };
+            }
+        };
+        // A valid negotiation response above also wins over session expiry.
+        // Every other session-bearing 404 means that the session expired.
+        if (sent_session and status == .not_found) return error.SessionExpired;
         const log_limit = 1024;
         const displayed = text[0..@min(text.len, log_limit)];
         if (text.len > log_limit)
@@ -219,6 +229,35 @@ fn isValidSessionId(value: []const u8) bool {
     return true;
 }
 
+const TestClient = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    http: std.http.Client,
+    server: struct {
+        endpoint: []const u8,
+        headers: ?@import("toml").HashMap([]const u8) = null,
+        oauth: ?void = null,
+    },
+    negotiated_version: []const u8 = "2026-07-28",
+    capabilities: struct {
+        has_sessions: bool = false,
+        has_mcp_method_header: bool = true,
+        has_mcp_name_header: bool = true,
+    } = .{},
+    session_id: ?[]const u8 = null,
+    authorization_header: ?[]const u8 = null,
+    oauth_challenge: ?@import("oauth.zig").OauthChallenge = null,
+    server_supported_versions: ?[]const []const u8 = null,
+
+    pub fn allowsServerRequests(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn respondServerRequest(_: *@This(), _: Value, _: []const u8) !void {
+        return error.UnexpectedServerRequest;
+    }
+};
+
 test "reserved headers include framing and hop-by-hop headers" {
     try std.testing.expect(isReservedHeader("Content-Length", false));
     try std.testing.expect(isReservedHeader("transfer-encoding", false));
@@ -256,37 +295,7 @@ test "modern request headers derive method and name from structured context" {
 }
 
 test "HTTP 400 unsupported-version response reaches JSON-RPC negotiation" {
-    const toml = @import("toml");
     const test_http = @import("test_http.zig");
-    const TestClient = struct {
-        allocator: std.mem.Allocator,
-        io: Io,
-        http: std.http.Client,
-        server: struct {
-            endpoint: []const u8,
-            headers: ?toml.HashMap([]const u8) = null,
-            oauth: ?void = null,
-        },
-        negotiated_version: []const u8 = "2026-07-28",
-        capabilities: struct {
-            has_sessions: bool = false,
-            has_mcp_method_header: bool = true,
-            has_mcp_name_header: bool = true,
-        } = .{},
-        session_id: ?[]const u8 = null,
-        authorization_header: ?[]const u8 = null,
-        oauth_challenge: ?@import("oauth.zig").OauthChallenge = null,
-        server_supported_versions: ?[]const []const u8 = null,
-
-        pub fn allowsServerRequests(_: *@This()) bool {
-            return false;
-        }
-
-        pub fn respondServerRequest(_: *@This(), _: Value, _: []const u8) !void {
-            return error.UnexpectedServerRequest;
-        }
-    };
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -321,4 +330,65 @@ test "HTTP 400 unsupported-version response reaches JSON-RPC negotiation" {
     try std.testing.expectEqual(@as(usize, 2), supported.len);
     try std.testing.expectEqualStrings("2025-06-18", supported[0]);
     try std.testing.expectEqualStrings("2026-07-28", supported[1]);
+}
+
+test "JSON 401 captures OAuth challenge and remains an HTTP failure" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()});
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "401 Unauthorized",
+            .extra_headers = "WWW-Authenticate: Bearer scope=\"tools:read\"\r\n",
+            .body = "{\"error\":\"invalid_token\"}",
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = TestClient{
+        .allocator = arena.allocator(),
+        .io = io,
+        .http = .{ .allocator = arena.allocator(), .io = io },
+        .server = .{ .endpoint = endpoint },
+    };
+    defer client.http.deinit();
+
+    try std.testing.expectError(error.HttpUnauthorized, requestInner(&client, "{}", false, 1, .{}));
+    try serving.await(io);
+    try std.testing.expectEqualStrings("tools:read", client.oauth_challenge.?.scope.?);
+}
+
+test "negotiation error takes precedence over session-bearing 404" {
+    const test_http = @import("test_http.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()});
+    var script = test_http.Script{ .responses = &.{
+        .{
+            .status = "404 Not Found",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"supported\":[\"2025-06-18\"]}}}",
+        },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var client = TestClient{
+        .allocator = arena.allocator(),
+        .io = io,
+        .http = .{ .allocator = arena.allocator(), .io = io },
+        .server = .{ .endpoint = endpoint },
+        .capabilities = .{ .has_sessions = true },
+        .session_id = "expired",
+    };
+    defer client.http.deinit();
+
+    try std.testing.expectError(error.UnsupportedProtocolVersionError, requestInner(&client, "{}", false, 1, .{}));
+    try serving.await(io);
+    try std.testing.expectEqualStrings("2025-06-18", client.server_supported_versions.?[0]);
 }
