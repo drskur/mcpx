@@ -590,6 +590,8 @@ fn resolveRedirectUrl(allocator: Allocator, base_url: []const u8, location: []co
 
 /// Surfaces the RFC 6749 section 5.2 error body instead of discarding it.
 fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.Status, body: []const u8) void {
+    diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: remote request failed\n", .{ url, @intFromEnum(status) });
+    if (!diagnostics_out.isDebug()) return;
     const displayed = body[0..@min(body.len, 512)];
     if (rpc.parseJson(allocator, body)) |value| {
         if (rpc.getString(value, "error")) |code| {
@@ -843,14 +845,10 @@ test "discovery redirect policy rejects cross-origin and scheme changes" {
     defer arena.deinit();
     const allocator = arena.allocator();
     try validateDiscoveryUrl(allocator, "https://mcp.example/next", "https://mcp.example/mcp", .resource);
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
-        validateDiscoveryUrl(allocator, "https://attacker.example/next", "https://mcp.example/mcp", .resource));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
-        validateDiscoveryUrl(allocator, "http://mcp.example/next", "https://mcp.example/mcp", .resource));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
-        validateDiscoveryUrl(allocator, "https://127.0.0.1/next", "https://issuer.example", .authorization_server));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
-        validateDiscoveryUrl(allocator, "https://10.0.0.1/next", "https://issuer.example", .authorization_server));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://attacker.example/next", "https://mcp.example/mcp", .resource));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "http://mcp.example/next", "https://mcp.example/mcp", .resource));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://127.0.0.1/next", "https://issuer.example", .authorization_server));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://10.0.0.1/next", "https://issuer.example", .authorization_server));
 }
 
 test "discovery follows safe relative redirects and rejects loops" {
@@ -885,8 +883,7 @@ test "discovery follows safe relative redirects and rejects loops" {
         .{ .status = "302 Found", .extra_headers = "Location: /a\r\n", .body = "" },
     } };
     var loop_serving = try io.concurrent(test_http.Script.serve, .{ &loop_script, io, &loop_server });
-    try std.testing.expectError(error.OauthDiscoveryRedirectLoop,
-        fetchDiscoveryJson(allocator, &http, loop_url, &.{}, loop_origin, .resource));
+    try std.testing.expectError(error.OauthDiscoveryRedirectLoop, fetchDiscoveryJson(allocator, &http, loop_url, &.{}, loop_origin, .resource));
     try loop_serving.await(io);
 }
 

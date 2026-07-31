@@ -103,7 +103,11 @@ rejected rather than being treated as arguments.
 | `6` | The tool ran and reported `isError` |
 | `7` | The tool needs more input (`resultType: input_required`) |
 
-A JSON-RPC error is reported on stderr with its `code`, `message` and `data`.
+A JSON-RPC error is reported on stderr with its code and a generic message.
+Remote response bodies, messages, and error data are hidden by default because
+they may contain submitted arguments or credentials. Set `MCPX_DEBUG=1` to
+include that raw diagnostic content; mcpx prints a warning because this mode
+may expose secrets in terminals and CI logs.
 
  `mcpx` negotiates
 MCP `2026-07-28` with `server/discover` and remains compatible with legacy
@@ -127,7 +131,7 @@ follow-up interaction automatically.
 ## Development
 
 ```sh
-zig build test          # 105 tests, including loopback HTTP integration tests
+zig build test          # includes loopback HTTP integration tests
 zig fmt --check src build.zig
 ```
 

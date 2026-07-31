@@ -196,12 +196,13 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
         // A valid negotiation response above also wins over session expiry.
         // Every other session-bearing 404 means that the session expired.
         if (sent_session and status == .not_found) return error.SessionExpired;
-        const log_limit = 1024;
-        const displayed = text[0..@min(text.len, log_limit)];
-        if (text.len > log_limit)
-            diagnostics_out.report("HTTP {d} {s}: {s}... (truncated)\n", .{ @intFromEnum(status), reason, displayed })
-        else
-            diagnostics_out.report("HTTP {d} {s}: {s}\n", .{ @intFromEnum(status), reason, displayed });
+        const safe_message = try diagnostics_out.safeRemoteMessage(self.allocator, "HTTP", @intFromEnum(status));
+        diagnostics_out.report("{s}\n", .{safe_message});
+        if (diagnostics_out.isDebug()) {
+            const log_limit = 1024;
+            const displayed = text[0..@min(text.len, log_limit)];
+            diagnostics_out.report("HTTP debug response ({s}): {s}{s}\n", .{ reason, displayed, if (text.len > log_limit) "... (truncated)" else "" });
+        }
         return classifyHttpFailure(status, context.probe);
     }
     if (notification) return null;

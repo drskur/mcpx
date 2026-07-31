@@ -67,6 +67,7 @@ fn exitCode(err: anyerror) u8 {
 
 fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
+    diagnostics_out.enableDebugFromEnvironment(init.minimal.environ.getAlloc(allocator, "MCPX_DEBUG") catch null);
     const args = try init.minimal.args.toSlice(allocator);
     const parsed = try cli.parseArgs(args);
     if (parsed.help) {
@@ -191,10 +192,13 @@ fn isToolError(result: Value) bool {
 /// carries far more than the propagated Zig error name.
 fn reportRpcFailure(client: *McpClient, err: anyerror) anyerror {
     if (client.last_rpc_error) |failure| {
-        diagnostics_out.report("RPC error {d}: {s}\n", .{ failure.code, failure.message });
-        if (failure.data) |data| if (rpc.jsonString(client.allocator, data)) |text|
-            diagnostics_out.report("RPC error data: {s}\n", .{text})
-        else |_| {};
+        diagnostics_out.report("RPC error {d}: remote request failed\n", .{failure.code});
+        if (diagnostics_out.isDebug()) {
+            diagnostics_out.report("RPC debug message: {s}\n", .{failure.message});
+            if (failure.data) |data| if (rpc.jsonString(client.allocator, data)) |text|
+                diagnostics_out.report("RPC debug data: {s}\n", .{text})
+            else |_| {};
+        }
     }
     return err;
 }
