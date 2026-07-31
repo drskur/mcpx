@@ -224,7 +224,7 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     };
     try candidates.appendSlice(allocator, &fallback_candidates);
     for (candidates.items) |url| {
-        const value = fetchJson(allocator, http, .GET, url, null, discovery_headers) catch continue;
+        const value = fetchDiscoveryJson(allocator, http, url, discovery_headers, endpoint, .resource) catch continue;
         issuers = try validateProtectedResourceMetadata(allocator, value, endpoint);
         break;
     }
@@ -233,7 +233,7 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     for (issuers) |issuer| {
         const metadata_urls = try authorizationMetadataUrls(allocator, issuer);
         for (metadata_urls) |metadata_url| {
-            const value = fetchJson(allocator, http, .GET, metadata_url, null, discovery_headers) catch continue;
+            const value = fetchDiscoveryJson(allocator, http, metadata_url, discovery_headers, issuer, .authorization_server) catch continue;
             return metadataFromJson(allocator, value, issuer) catch |err| {
                 diagnostics_out.warn("rejecting authorization server metadata at {s}: {s}\n", .{ metadata_url, @errorName(err) });
                 continue;
@@ -518,6 +518,76 @@ fn fetchJson(allocator: Allocator, http: *std.http.Client, method: std.http.Meth
     return rpc.parseJson(allocator, body);
 }
 
+const DiscoveryPolicy = enum { resource, authorization_server };
+const max_discovery_redirects = 8;
+
+fn fetchDiscoveryJson(allocator: Allocator, http: *std.http.Client, initial_url: []const u8, headers: []const std.http.Header, policy_url: []const u8, policy: DiscoveryPolicy) !Value {
+    var current = initial_url;
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    defer visited.deinit(allocator);
+    var redirects: usize = 0;
+    while (true) {
+        if (visited.contains(current)) return error.OauthDiscoveryRedirectLoop;
+        try visited.put(allocator, try allocator.dupe(u8, current), {});
+        try validateDiscoveryUrl(allocator, current, policy_url, policy);
+
+        const uri = std.Uri.parse(current) catch return error.OauthDiscoveryRedirectInvalidUrl;
+        var request = try http.request(.GET, uri, .{ .extra_headers = headers, .redirect_behavior = .unhandled });
+        errdefer request.deinit();
+        try request.sendBodiless();
+        var response = try request.receiveHead(&.{});
+        if (response.head.status.class() == .redirect) {
+            const location = response.head.location orelse return error.OauthDiscoveryRedirectMissingLocation;
+            if (redirects == max_discovery_redirects) return error.OauthDiscoveryTooManyRedirects;
+            current = try resolveRedirectUrl(allocator, current, location);
+            redirects += 1;
+            request.deinit();
+            continue;
+        }
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+        const buffer = try allocator.alloc(u8, max_metadata_size + 1);
+        var output: Io.Writer = .fixed(buffer);
+        _ = reader.stream(&output, .limited(max_metadata_size + 1)) catch |err| switch (err) {
+            error.EndOfStream => {},
+            else => return err,
+        };
+        const body = output.buffered();
+        if (body.len > max_metadata_size) return error.OauthResponseTooLarge;
+        if (response.head.status.class() != .success) {
+            reportOauthFailure(allocator, current, response.head.status, body);
+            request.deinit();
+            return error.OauthHttpRequestFailed;
+        }
+        const value = try rpc.parseJson(allocator, body);
+        request.deinit();
+        return value;
+    }
+}
+
+fn validateDiscoveryUrl(allocator: Allocator, url: []const u8, policy_url: []const u8, policy: DiscoveryPolicy) !void {
+    sameOrigin(allocator, url, policy_url) catch return error.OauthDiscoveryRedirectPolicyViolation;
+    if (policy == .authorization_server) try requireSecureUrl(allocator, url);
+}
+
+fn resolveRedirectUrl(allocator: Allocator, base_url: []const u8, location: []const u8) ![]const u8 {
+    if (location.len == 0) return error.OauthDiscoveryRedirectInvalidUrl;
+    if (std.mem.startsWith(u8, location, "https://") or std.mem.startsWith(u8, location, "http://"))
+        return allocator.dupe(u8, location);
+    if (std.mem.indexOfScalar(u8, location, ':')) |colon| {
+        const slash = std.mem.indexOfScalar(u8, location, '/') orelse location.len;
+        if (colon < slash) return error.OauthDiscoveryRedirectInvalidUrl;
+    }
+    if (std.mem.startsWith(u8, location, "//")) return error.OauthDiscoveryRedirectInvalidUrl;
+    const base = std.Uri.parse(base_url) catch return error.OauthDiscoveryRedirectInvalidUrl;
+    const origin = try originUrl(allocator, base);
+    if (location[0] == '/') return std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, location });
+    const path = try componentText(allocator, base.path);
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.OauthDiscoveryRedirectInvalidUrl;
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ origin, path[0 .. slash + 1], location });
+}
+
 /// Surfaces the RFC 6749 section 5.2 error body instead of discarding it.
 fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.Status, body: []const u8) void {
     const displayed = body[0..@min(body.len, 512)];
@@ -766,6 +836,58 @@ test "challenge metadata URLs are confined to the resource server origin" {
         error.OauthChallengeInvalidUrl,
         sameOrigin(allocator, "not-a-url", endpoint),
     );
+}
+
+test "discovery redirect policy rejects cross-origin and scheme changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try validateDiscoveryUrl(allocator, "https://mcp.example/next", "https://mcp.example/mcp", .resource);
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
+        validateDiscoveryUrl(allocator, "https://attacker.example/next", "https://mcp.example/mcp", .resource));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
+        validateDiscoveryUrl(allocator, "http://mcp.example/next", "https://mcp.example/mcp", .resource));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
+        validateDiscoveryUrl(allocator, "https://127.0.0.1/next", "https://issuer.example", .authorization_server));
+    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation,
+        validateDiscoveryUrl(allocator, "https://10.0.0.1/next", "https://issuer.example", .authorization_server));
+}
+
+test "discovery follows safe relative redirects and rejects loops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const test_http = @import("test_http.zig");
+
+    var server = try test_http.listenLoopback(io);
+    defer server.deinit(io);
+    const origin = try test_http.originFor(allocator, &server);
+    const start = try std.fmt.allocPrint(allocator, "{s}/metadata/start", .{origin});
+    var script = test_http.Script{ .keep_alive = true, .responses = &.{
+        .{ .status = "302 Found", .extra_headers = "Location: next\r\n", .body = "" },
+        .{ .status = "200 OK", .body = "{\"ok\":true}" },
+    } };
+    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const value = try fetchDiscoveryJson(allocator, &http, start, &.{}, origin, .resource);
+    try serving.await(io);
+    try std.testing.expect(rpc.get(value, "ok").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, script.request(1), "/metadata/next") != null);
+
+    var loop_server = try test_http.listenLoopback(io);
+    defer loop_server.deinit(io);
+    const loop_origin = try test_http.originFor(allocator, &loop_server);
+    const loop_url = try std.fmt.allocPrint(allocator, "{s}/a", .{loop_origin});
+    var loop_script = test_http.Script{ .keep_alive = true, .responses = &.{
+        .{ .status = "302 Found", .extra_headers = "Location: /b\r\n", .body = "" },
+        .{ .status = "302 Found", .extra_headers = "Location: /a\r\n", .body = "" },
+    } };
+    var loop_serving = try io.concurrent(test_http.Script.serve, .{ &loop_script, io, &loop_server });
+    try std.testing.expectError(error.OauthDiscoveryRedirectLoop,
+        fetchDiscoveryJson(allocator, &http, loop_url, &.{}, loop_origin, .resource));
+    try loop_serving.await(io);
 }
 
 test "authorization URL and token forms carry the canonical resource" {
