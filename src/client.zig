@@ -48,6 +48,11 @@ pub const ResultType = enum {
     input_required,
 };
 
+pub const RpcOutcome = union(enum) {
+    complete: Value,
+    input_required: Value,
+};
+
 pub fn resultType(result: Value, supports_result_type: bool) !ResultType {
     if (!supports_result_type) return .complete;
     const raw = rpc_module.getString(result, "resultType") orelse return .complete;
@@ -244,9 +249,17 @@ pub const McpClient = struct {
     }
 
     pub fn rpc(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
+        return switch (try self.rpcOutcome(method, params)) {
+            .complete => |result| result,
+            .input_required => error.InputRequired,
+        };
+    }
+
+    pub fn rpcOutcome(self: *McpClient, method: []const u8, params: ?Value) anyerror!RpcOutcome {
         if ((std.mem.eql(u8, method, "tools/list") or std.mem.eql(u8, method, "tools/call")) and !self.supports_tools)
             return error.ServerDoesNotSupportTools;
-        return self.rpcUnchecked(method, params);
+        const result = try self.rpcUnchecked(method, params);
+        return outcomeFor(result, self.capabilities.supports_result_type);
     }
 
     fn rpcUnchecked(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
@@ -271,7 +284,6 @@ pub const McpClient = struct {
             .{ .method = method, .name = name, .param_headers = param_headers, .initialize = initialize_request },
             self.server.timeoutSecs(),
         )).?;
-        _ = try resultType(result, self.capabilities.supports_result_type);
         return result;
     }
 
@@ -347,7 +359,10 @@ pub const McpClient = struct {
                 try object.object.put(self.allocator, "cursor", .{ .string = c });
                 params = object;
             }
-            const result = try self.rpc("tools/list", params);
+            const result = switch (try self.rpcOutcome("tools/list", params)) {
+                .complete => |complete| complete,
+                .input_required => return error.InputRequired,
+            };
             const list = rpc_module.get(result, "tools") orelse return error.ToolsListMissingTools;
             if (list != .array) return error.ToolsListMissingTools;
             try enforcePaginationLimits(page_count - 1, tools.items.len, list.array.items.len);
@@ -371,6 +386,13 @@ pub const McpClient = struct {
         return tools.toOwnedSlice(self.allocator);
     }
 };
+
+fn outcomeFor(result: Value, supports_result_type: bool) !RpcOutcome {
+    return switch (try resultType(result, supports_result_type)) {
+        .complete => .{ .complete = result },
+        .input_required => .{ .input_required = result },
+    };
+}
 
 fn validateHeaderMappings(allocator: Allocator, tool: Value) ![]const HeaderMapping {
     const schema = rpc_module.get(tool, "inputSchema") orelse return &.{};
@@ -503,6 +525,29 @@ test "resultType supports complete input-required and legacy omission" {
     try std.testing.expectEqual(ResultType.complete, try resultType(complete, true));
     try std.testing.expectEqual(ResultType.input_required, try resultType(pending, true));
     try std.testing.expectEqual(ResultType.complete, try resultType(missing, false));
+}
+
+test "tools call input-required is surfaced as a distinct intact outcome" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pending = try std.json.parseFromSliceLeaky(Value, arena.allocator(),
+        \\{"resultType":"input_required","inputRequests":{"confirm":{"type":"elicitation"}},"requestState":"opaque"}
+    , .{});
+    const outcome = try outcomeFor(pending, true);
+    try std.testing.expect(outcome == .input_required);
+    try std.testing.expectEqualStrings("opaque", rpc_module.getString(outcome.input_required, "requestState").?);
+    try std.testing.expect(rpc_module.get(outcome.input_required, "inputRequests").? == .object);
+}
+
+test "tools list input-required does not enter final tools parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pending = try std.json.parseFromSliceLeaky(Value, arena.allocator(),
+        \\{"resultType":"input_required","inputRequests":{},"requestState":"list-state"}
+    , .{});
+    const outcome = try outcomeFor(pending, true);
+    try std.testing.expect(outcome == .input_required);
+    try std.testing.expect(rpc_module.get(outcome.input_required, "tools") == null);
 }
 
 test "tool header annotations are validated and primitive arguments are mirrored" {

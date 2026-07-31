@@ -91,7 +91,10 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
         var params = Value{ .object = .empty };
         try params.object.put(allocator, "name", .{ .string = parsed.positionals[1] });
         try params.object.put(allocator, "arguments", call_args);
-        const result = try client.rpc("tools/call", params);
+        const result = switch (try client.rpcOutcome("tools/call", params)) {
+            .complete => |value| value,
+            .input_required => |value| value,
+        };
         try skills.prettyPrint(out, result);
         return;
     }
