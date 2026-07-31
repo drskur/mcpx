@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-const version = "0.1.0";
+const version = "0.2.0";
 
 const toml = @import("toml");
 const client_module = @import("client.zig");

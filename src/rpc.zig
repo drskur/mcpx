@@ -36,6 +36,7 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64) !Valu
         const code = displayScalar(allocator, code_value) catch "?";
         std.debug.print("RPC error [{s}]: {s}\n", .{ code, message });
         if (code_value.integer == -32022) return error.UnsupportedProtocolVersionError;
+        if (code_value.integer == -32601) return error.MethodNotFound;
         return error.JsonRpcError;
     }
     return result.?;

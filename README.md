@@ -36,14 +36,19 @@ register = true               # RFC 7591 dynamic client registration
 The default timeout is 30 seconds. Pass `-c <path>` to use another
 configuration file.
 
-For an OAuth-configured server, mcpx discovers the MCP protected resource and
-authorization server metadata, uses Authorization Code with PKCE (S256), opens
+For an OAuth-configured server, mcpx honors `WWW-Authenticate`
+`resource_metadata` challenges or RFC 9728 protected-resource discovery, then
+tries RFC 8414 Authorization Server Metadata and OIDC Discovery. It uses
+Authorization Code with PKCE (S256), opens
 the authorization URL with `xdg-open` on Linux, and waits for one redirect to
 an ephemeral `127.0.0.1` callback port. The URL is always printed to stderr so
-it can be opened manually. The callback state is verified before the code is
-exchanged.
+it can be opened manually. The callback state and authorization-server `iss`
+(when supplied or required) are verified before code exchange. Both
+authorization-code and refresh grants include the MCP endpoint as RFC 8707
+`resource`.
 
-Tokens and dynamically registered client credentials are stored separately in
+Tokens and dynamically registered client credentials are keyed by validated
+issuer and stored separately in
 `~/.config/mcpx/tokens.toml`. The file is atomically replaced with owner-only
 `0600` permissions after grants and refreshes. Access tokens are refreshed when
 they are expired or within 60 seconds of expiry. To discard the effective
@@ -67,6 +72,21 @@ mcpx call <server> <tool> [json_args]
 mcpx skills <server> [tool]
 ```
 
-`mcpx servers` appends `[oauth]` to OAuth-enabled entries. `mcpx` initializes
-one stateful MCP session per invocation, supports JSON and SSE responses, and
+`mcpx servers` appends `[oauth]` to OAuth-enabled entries. `mcpx` negotiates
+MCP `2026-07-28` with `server/discover` and remains compatible with legacy
+`2025-03-26` initialize/session servers. It supports JSON and SSE responses and
 follows all `tools/list` pagination cursors.
+
+## Protocol compatibility
+
+Protocol behavior comes from one version/capability table covering
+`2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`. mcpx attempts
+modern discovery first, honors `-32022` supported-version responses by choosing
+the newest mutual version, and falls back to legacy initialize when
+`server/discover` is unavailable.
+
+For `2026-07-28`, requests include protocol/client `_meta`, `Mcp-Method`, and
+`Mcp-Name` where applicable. Modern requests do not use MCP sessions or legacy
+cancellation notifications. A result with `resultType: input_required` is
+returned intact; mcpx does not yet conduct that follow-up interaction
+automatically.

@@ -10,7 +10,7 @@ const transport = @import("transport.zig");
 const oauth_module = @import("oauth.zig");
 const protocol = @import("protocol.zig");
 
-const version = "0.1.0";
+const version = "0.2.0";
 const max_pagination_pages: usize = 1000;
 const max_pagination_tools: usize = 100_000;
 
@@ -97,14 +97,14 @@ pub const McpClient = struct {
                 self.negotiated_version = selected.name;
                 self.capabilities = selected.capabilities;
                 if (!selected.capabilities.needs_discover) {
-                    try self.connectLegacy();
+                    try self.connectInitialized(selected.name);
                     return;
                 }
                 break :blk try self.rpcUnchecked("server/discover", null);
             },
             // A 2025-03-26 server does not implement server/discover.
-            error.JsonRpcError => {
-                try self.connectLegacy();
+            error.MethodNotFound, error.HttpRequestFailed => {
+                try self.connectInitialized(protocol.legacy_version);
                 return;
             },
             else => return err,
@@ -112,11 +112,12 @@ pub const McpClient = struct {
         try self.applyDiscovery(discovered);
     }
 
-    fn connectLegacy(self: *McpClient) !void {
-        self.negotiated_version = protocol.legacy_version;
-        self.capabilities = protocol.capabilitiesFor(protocol.legacy_version).?;
+    fn connectInitialized(self: *McpClient, proposed_version: []const u8) !void {
+        self.negotiated_version = proposed_version;
+        self.capabilities = protocol.capabilitiesFor(proposed_version) orelse
+            return error.UnsupportedProtocolVersion;
         var params = Value{ .object = .empty };
-        try params.object.put(self.allocator, "protocolVersion", .{ .string = protocol.legacy_version });
+        try params.object.put(self.allocator, "protocolVersion", .{ .string = proposed_version });
         try params.object.put(self.allocator, "capabilities", .{ .object = .empty });
         var info = Value{ .object = .empty };
         try info.object.put(self.allocator, "name", .{ .string = "mcpx" });
@@ -270,7 +271,8 @@ pub const McpClient = struct {
         if (!self.capabilities.needs_meta) return supplied;
         var params = supplied orelse Value{ .object = .empty };
         if (params != .object) return error.ModernParamsMustBeObject;
-        var meta = Value{ .object = .empty };
+        var meta = rpc_module.get(params, "_meta") orelse Value{ .object = .empty };
+        if (meta != .object) return error.ModernMetaMustBeObject;
         try meta.object.put(self.allocator, "io.modelcontextprotocol/protocolVersion", .{ .string = self.negotiated_version });
         try meta.object.put(self.allocator, "io.modelcontextprotocol/clientCapabilities", .{ .object = .empty });
         var info = Value{ .object = .empty };

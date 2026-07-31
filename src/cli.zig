@@ -50,7 +50,7 @@ pub fn writeUsage(io: Io) !void {
     var buffer: [2048]u8 = undefined;
     var file: Io.File.Writer = .init(.stdout(), io, &buffer);
     try file.interface.writeAll(
-        \\mcpx 0.1.0 - CLI bridge for MCP HTTP servers
+        \\mcpx 0.2.0 - CLI bridge for MCP HTTP servers
         \\
         \\Usage: mcpx [-c PATH] <COMMAND>
         \\

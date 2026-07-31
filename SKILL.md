@@ -28,13 +28,16 @@ register = true               # optional RFC 7591 dynamic registration
 
 Multiple `[[http]]` blocks register multiple servers. `-c` and `--config` are global flags and work anywhere in the argument list, including after the command or its positionals.
 
-OAuth-enabled servers use the MCP 2025-03-26 Authorization Code + PKCE flow.
-mcpx discovers protected-resource and authorization-server metadata, generates
+OAuth-enabled servers use Authorization Code + PKCE. mcpx honors
+`WWW-Authenticate` protected-resource challenges and RFC 9728 fallback, then
+tries RFC 8414 and OIDC authorization-server discovery. It generates
 an S256 PKCE challenge and CSRF state, opens the authorization URL with
 `xdg-open` on Linux, and accepts one redirect on an ephemeral
 `127.0.0.1` port. The URL is printed to stderr as a manual fallback. Dynamic
-registration uses RFC 7591 when `register = true`; a configured `client_id`, or
-a previously persisted dynamically registered client, is reused.
+registration uses RFC 7591 with `application_type: native` when
+`register = true`; credentials are reused only for the same validated issuer.
+The callback `iss` is checked before code redemption, and both code and refresh
+token requests include the MCP endpoint as RFC 8707 `resource`.
 
 OAuth tokens and client credentials are kept out of the main config in
 `~/.config/mcpx/tokens.toml`. Grants and refreshes atomically replace this file
@@ -115,13 +118,14 @@ The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, 
 ## Protocol Behavior and Limits
 
 - `McpClient.init` requires an arena or process-scoped allocator that outlives the client. Individual client allocations are intentionally not freed; a general-purpose allocator is not supported for repeated client reuse.
-- mcpx proposes and accepts only MCP protocol version `2025-03-26`; other versions produce `UnsupportedProtocolVersion`.
+- mcpx knows `2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`. It attempts `server/discover`, selects the newest mutual version from a `-32022` response, and falls back to legacy initialize when discovery is unavailable.
 - Before `tools/list` or `tools/call`, mcpx checks the initialized server's `capabilities.tools`; absence produces `ServerDoesNotSupportTools`.
-- One stateful MCP session is initialized per invocation. `Mcp-Session-Id` is accepted only from the `initialize` response, must contain visible ASCII characters only, and is reused for later requests. If a request carrying it receives HTTP 404, mcpx clears the session, reconnects, and retries that request once.
-- The configured timeout covers the entire request, including URI resolution, DNS, connection establishment, TLS, and response-body reading. Those stages produce their own errors only when they fail before the timer fires. On timeout, mcpx attempts to send `notifications/cancelled` for an outstanding request using a separate fixed 5-second timeout, except initialization requests, which MCP prohibits cancelling. Cancellation therefore adds at most 5 seconds.
+- `2026-07-28` requests carry protocol/client `_meta`, `Mcp-Method`, and (for named requests) `Mcp-Name`. `resultType: input_required` is surfaced intact; automatic multi-round-trip continuation is not implemented.
+- Stateful `Mcp-Session-Id`, 404 session recovery, server requests/ping, and `notifications/cancelled` are enabled only when the negotiated version's capability row permits them. They remain active for legacy `2025-03-26`; modern cancellation closes the response stream.
+- The configured timeout covers the entire request, including URI resolution, DNS, connection establishment, TLS, and response-body reading. Legacy cancellation uses a separate fixed 5-second timeout.
 - Response bodies are limited to 16 MiB. Larger responses produce `ResponseTooLarge`.
 - SSE events are parsed incrementally. Every message in a JSON-RPC batch is inspected before a matching numeric response is returned. Valid JSON-RPC 2.0 server requests are answered immediately during stream consumption using a separate HTTP POST: `ping` receives an empty successful result and unknown methods receive method-not-found. Notifications are inspected but require no response.
-- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning. `Authorization` is additionally reserved and managed by mcpx when the server has an OAuth block. Without OAuth, a static configured `Authorization` header is still allowed.
+- Configured headers cannot override `Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Session-Id`, `Mcp-Method`, `Mcp-Name`, or HTTP framing and hop-by-hop headers; matching names are skipped case-insensitively with a warning. `Authorization` is additionally reserved and managed by mcpx when the server has an OAuth block. Without OAuth, a static configured `Authorization` header is still allowed.
 - Up to 1,000 `tools/list` pages and 100,000 tools are fetched automatically; exceeding either aggregate limit produces `PaginationLimitExceeded`. Empty `nextCursor` ends pagination, and a repeated non-empty cursor produces `RepeatedPaginationCursor`.
 
 ## Exit Codes and Errors
