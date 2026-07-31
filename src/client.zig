@@ -38,6 +38,19 @@ pub const Tool = struct {
     }
 };
 
+pub const ResultType = enum {
+    complete,
+    input_required,
+};
+
+pub fn resultType(result: Value, supports_result_type: bool) !ResultType {
+    if (!supports_result_type) return .complete;
+    const raw = rpc_module.getString(result, "resultType") orelse return .complete;
+    if (std.mem.eql(u8, raw, "complete")) return .complete;
+    if (std.mem.eql(u8, raw, "input_required")) return .input_required;
+    return error.UnsupportedResultType;
+}
+
 pub const McpClient = struct {
     allocator: Allocator,
     io: Io,
@@ -130,11 +143,11 @@ pub const McpClient = struct {
     }
 
     pub fn request(self: *McpClient, body: []const u8, notification: bool) !?Value {
-        return self.requestExpected(body, notification, null, true, false);
+        return self.requestExpected(body, notification, null, true, false, .{});
     }
 
-    pub fn requestExpected(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, allow_session_recovery: bool, cancellable: bool) anyerror!?Value {
-        return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, false, self.server.timeoutSecs());
+    pub fn requestExpected(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, allow_session_recovery: bool, cancellable: bool, context: transport.RequestContext) anyerror!?Value {
+        return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, context, self.server.timeoutSecs());
     }
 
     pub fn requestExpectedWithTimeout(
@@ -144,7 +157,7 @@ pub const McpClient = struct {
         expected_id: ?i64,
         allow_session_recovery: bool,
         cancellable: bool,
-        initialize_request: bool,
+        context: transport.RequestContext,
         timeout_secs: u64,
     ) anyerror!?Value {
         if (self.server.oauth) |oauth_config| if (self.authorization_header == null) {
@@ -162,7 +175,7 @@ pub const McpClient = struct {
         const Result = union(enum) { response: anyerror!?Value, timeout: void };
         var completions: [2]Result = undefined;
         var select: Io.Select(Result) = .init(self.io, &completions);
-        try select.concurrent(.response, requestInner, .{ self, body, notification, expected_id, initialize_request });
+        try select.concurrent(.response, requestInner, .{ self, body, notification, expected_id, context });
         try select.concurrent(.timeout, transport.waitForTimeout, .{ self.io, timeout_secs });
         const result = try select.await();
         select.cancelDiscard();
@@ -181,21 +194,21 @@ pub const McpClient = struct {
                         self.token_path,
                     );
                     try self.setAuthorization(token);
-                    return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, initialize_request, timeout_secs);
+                    return self.requestExpectedWithTimeout(body, notification, expected_id, allow_session_recovery, cancellable, context, timeout_secs);
                 }
-                if (err == error.SessionExpired and allow_session_recovery) {
+                if (err == error.SessionExpired and self.capabilities.has_sessions and allow_session_recovery) {
                     self.session_id = null;
                     self.negotiated_version = protocol.legacy_version;
                     self.capabilities = protocol.capabilitiesFor(protocol.legacy_version).?;
                     self.supports_tools = false;
                     try self.connect();
-                    return self.requestExpectedWithTimeout(body, notification, expected_id, false, cancellable, initialize_request, timeout_secs);
+                    return self.requestExpectedWithTimeout(body, notification, expected_id, false, cancellable, context, timeout_secs);
                 }
                 return err;
             },
             .timeout => {
                 std.debug.print("request to {s} timed out after {d} seconds\n", .{ self.server.endpoint, timeout_secs });
-                if (cancellable) if (expected_id) |id| transport.notifyCancelled(self, id) catch |err|
+                if (cancellable and self.capabilities.has_cancel_notification) if (expected_id) |id| transport.notifyCancelled(self, id) catch |err|
                     std.debug.print("failed to send cancellation for request {d}: {s}\n", .{ id, @errorName(err) });
                 return error.RequestTimedOut;
             },
@@ -227,24 +240,43 @@ pub const McpClient = struct {
     }
 
     fn rpcUnchecked(self: *McpClient, method: []const u8, params: ?Value) anyerror!Value {
+        const request_params = try self.prepareParams(params);
         var request_value = Value{ .object = .empty };
         try request_value.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
         const request_id: i64 = @intCast(self.next_id);
         try request_value.object.put(self.allocator, "id", .{ .integer = request_id });
         try request_value.object.put(self.allocator, "method", .{ .string = method });
-        if (params) |p| try request_value.object.put(self.allocator, "params", p);
+        if (request_params) |p| try request_value.object.put(self.allocator, "params", p);
         self.next_id += 1;
         const body = try rpc_module.jsonString(self.allocator, request_value);
         const initialize_request = std.mem.eql(u8, method, "initialize");
-        return (try self.requestExpectedWithTimeout(
+        const name = requestName(request_params);
+        const result = (try self.requestExpectedWithTimeout(
             body,
             false,
             request_id,
             true,
             !initialize_request,
-            initialize_request,
+            .{ .method = method, .name = name, .initialize = initialize_request },
             self.server.timeoutSecs(),
         )).?;
+        _ = try resultType(result, self.capabilities.supports_result_type);
+        return result;
+    }
+
+    fn prepareParams(self: *McpClient, supplied: ?Value) !?Value {
+        if (!self.capabilities.needs_meta) return supplied;
+        var params = supplied orelse Value{ .object = .empty };
+        if (params != .object) return error.ModernParamsMustBeObject;
+        var meta = Value{ .object = .empty };
+        try meta.object.put(self.allocator, "io.modelcontextprotocol/protocolVersion", .{ .string = self.negotiated_version });
+        try meta.object.put(self.allocator, "io.modelcontextprotocol/clientCapabilities", .{ .object = .empty });
+        var info = Value{ .object = .empty };
+        try info.object.put(self.allocator, "name", .{ .string = "mcpx" });
+        try info.object.put(self.allocator, "version", .{ .string = version });
+        try meta.object.put(self.allocator, "io.modelcontextprotocol/clientInfo", info);
+        try params.object.put(self.allocator, "_meta", meta);
+        return params;
     }
 
     fn notifyInitialized(self: *McpClient) !void {
@@ -252,13 +284,17 @@ pub const McpClient = struct {
         try note.object.put(self.allocator, "jsonrpc", .{ .string = "2.0" });
         try note.object.put(self.allocator, "method", .{ .string = "notifications/initialized" });
         const body = try rpc_module.jsonString(self.allocator, note);
-        _ = try self.requestExpected(body, true, null, false, false);
+        _ = try self.requestExpected(body, true, null, false, false, .{ .method = "notifications/initialized" });
     }
 
     pub fn respondServerRequest(self: *McpClient, id: Value, method: []const u8) !void {
         if (std.mem.eql(u8, method, "ping"))
             return transport.respondPing(self, id);
         return transport.respondMethodNotFound(self, id);
+    }
+
+    pub fn allowsServerRequests(self: *McpClient) bool {
+        return self.capabilities.allows_server_requests;
     }
 
     pub fn listTools(self: *McpClient) ![]const Tool {
@@ -315,8 +351,13 @@ fn enforcePaginationLimits(page_count: usize, total_tools: usize, additional_too
     if (additional_tools > max_pagination_tools -| total_tools) return error.PaginationLimitExceeded;
 }
 
-fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, initialize_request: bool) anyerror!?Value {
-    return transport.requestInner(self, body, notification, expected_id, initialize_request);
+fn requestInner(self: *McpClient, body: []const u8, notification: bool, expected_id: ?i64, context: transport.RequestContext) anyerror!?Value {
+    return transport.requestInner(self, body, notification, expected_id, context);
+}
+
+fn requestName(params: ?Value) ?[]const u8 {
+    const value = params orelse return null;
+    return rpc_module.getString(value, "name") orelse rpc_module.getString(value, "uri");
 }
 
 test "initialization requires serverInfo version" {
@@ -336,4 +377,31 @@ test "initialization requires tools capability to be an object" {
 test "pagination aggregate limits are enforced" {
     try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(max_pagination_pages, 0, 0));
     try std.testing.expectError(error.PaginationLimitExceeded, enforcePaginationLimits(1, max_pagination_tools, 1));
+}
+
+test "modern params receive protocol client metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client = McpClient.init(arena.allocator(), std.testing.io, .{
+        .name = "test",
+        .endpoint = "https://example.test/mcp",
+    }, "unused");
+    defer client.deinit();
+    const params = (try client.prepareParams(null)).?;
+    const meta = rpc_module.get(params, "_meta").?;
+    try std.testing.expectEqualStrings("2026-07-28", rpc_module.getString(meta, "io.modelcontextprotocol/protocolVersion").?);
+    try std.testing.expect(rpc_module.get(meta, "io.modelcontextprotocol/clientCapabilities").? == .object);
+    const info = rpc_module.get(meta, "io.modelcontextprotocol/clientInfo").?;
+    try std.testing.expectEqualStrings("mcpx", rpc_module.getString(info, "name").?);
+}
+
+test "resultType supports complete input-required and legacy omission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const complete = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"resultType\":\"complete\"}", .{});
+    const pending = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{\"resultType\":\"input_required\"}", .{});
+    const missing = try std.json.parseFromSliceLeaky(Value, arena.allocator(), "{}", .{});
+    try std.testing.expectEqual(ResultType.complete, try resultType(complete, true));
+    try std.testing.expectEqual(ResultType.input_required, try resultType(pending, true));
+    try std.testing.expectEqual(ResultType.complete, try resultType(missing, false));
 }

@@ -6,14 +6,37 @@ const rpc = @import("rpc.zig");
 
 const max_response_size = 16 * 1024 * 1024;
 
-pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64, initialize_request: bool) anyerror!?Value {
+pub const RequestContext = struct {
+    method: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    initialize: bool = false,
+};
+
+pub fn requestHeaders(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    caps: anytype,
+    context: RequestContext,
+) ![]const std.http.Header {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    try headers.append(allocator, .{ .name = "Accept", .value = "application/json, text/event-stream" });
+    try headers.append(allocator, .{ .name = "MCP-Protocol-Version", .value = version });
+    if (caps.has_mcp_method_header) if (context.method) |method|
+        try headers.append(allocator, .{ .name = "Mcp-Method", .value = method });
+    if (caps.has_mcp_name_header) if (context.name) |name|
+        try headers.append(allocator, .{ .name = "Mcp-Name", .value = name });
+    return headers.toOwnedSlice(allocator);
+}
+
+pub fn requestInner(self: anytype, body: []const u8, notification: bool, expected_id: ?i64, context: RequestContext) anyerror!?Value {
     const uri = try std.Uri.parse(self.server.endpoint);
     var extra: std.ArrayList(std.http.Header) = .empty;
     defer extra.deinit(self.allocator);
-    try extra.append(self.allocator, .{ .name = "Accept", .value = "application/json, text/event-stream" });
-    try extra.append(self.allocator, .{ .name = "MCP-Protocol-Version", .value = self.negotiated_version });
-    const sent_session = self.session_id != null;
-    if (self.session_id) |sid| try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
+    const protocol_headers = try requestHeaders(self.allocator, self.negotiated_version, self.capabilities, context);
+    try extra.appendSlice(self.allocator, protocol_headers);
+    const sent_session = self.capabilities.has_sessions and self.session_id != null;
+    if (self.capabilities.has_sessions) if (self.session_id) |sid|
+        try extra.append(self.allocator, .{ .name = "Mcp-Session-Id", .value = sid });
     if (self.authorization_header) |authorization|
         try extra.append(self.allocator, .{ .name = "Authorization", .value = authorization });
     if (self.server.headers) |headers| {
@@ -45,7 +68,7 @@ pub fn requestInner(self: anytype, body: []const u8, notification: bool, expecte
     const status = response.head.status;
     const content_type = try self.allocator.dupe(u8, response.head.content_type orelse "");
     const reason = try self.allocator.dupe(u8, response.head.reason);
-    if (initialize_request and self.session_id == null) {
+    if (self.capabilities.has_sessions and context.initialize and self.session_id == null) {
         var it = response.head.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "Mcp-Session-Id")) {
             if (!isValidSessionId(h.value)) return error.InvalidSessionId;
@@ -111,7 +134,7 @@ pub fn notifyCancelled(self: anytype, id: i64) !void {
     try note.object.put(self.allocator, "method", .{ .string = "notifications/cancelled" });
     try note.object.put(self.allocator, "params", params);
     const body = try rpc.jsonString(self.allocator, note);
-    _ = try self.requestExpectedWithTimeout(body, true, null, false, false, false, 5);
+    _ = try self.requestExpectedWithTimeout(body, true, null, false, false, .{ .method = "notifications/cancelled" }, 5);
 }
 
 pub fn respondPing(self: anytype, id: Value) !void {
@@ -139,7 +162,7 @@ fn sendServerResponse(self: anytype, response: Value) !void {
         try responses.append(self.allocator, body);
         return;
     }
-    _ = try self.requestExpected(body, true, null, false, false);
+    _ = try self.requestExpected(body, true, null, false, false, .{});
 }
 
 fn isReservedHeader(name: []const u8, oauth_active: bool) bool {
@@ -149,6 +172,8 @@ fn isReservedHeader(name: []const u8, oauth_active: bool) bool {
         "content-type",
         "mcp-protocol-version",
         "mcp-session-id",
+        "mcp-method",
+        "mcp-name",
         "content-length",
         "transfer-encoding",
         "host",
@@ -191,4 +216,17 @@ test "session IDs contain visible ASCII only" {
     try std.testing.expect(!isValidSessionId("has space"));
     try std.testing.expect(!isValidSessionId("has\nnewline"));
     try std.testing.expect(!isValidSessionId(&[_]u8{0x7f}));
+}
+
+test "modern request headers derive method and name from structured context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers = try requestHeaders(arena.allocator(), "2026-07-28", .{
+        .has_mcp_method_header = true,
+        .has_mcp_name_header = true,
+    }, .{ .method = "tools/call", .name = "search" });
+    try std.testing.expectEqualStrings("Mcp-Method", headers[2].name);
+    try std.testing.expectEqualStrings("tools/call", headers[2].value);
+    try std.testing.expectEqualStrings("Mcp-Name", headers[3].name);
+    try std.testing.expectEqualStrings("search", headers[3].value);
 }

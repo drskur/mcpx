@@ -159,7 +159,7 @@ fn processSseEvent(
         const valid_jsonrpc = jsonrpc != null and std.mem.eql(u8, jsonrpc.?, "2.0");
         if (valid_jsonrpc and getString(event, "method") != null) {
             const method = getString(event, "method").?;
-            if (get(event, "id")) |id|
+            if (self.allowsServerRequests()) if (get(event, "id")) |id|
                 try pending_server_requests.append(self.allocator, .{ .id = id, .method = method });
         } else if (responseIdMatches(event, expected_id)) {
             matching_response = event;
@@ -203,6 +203,10 @@ const TestClient = struct {
 
     fn respondServerRequest(self: *TestClient, id: Value, method: []const u8) !void {
         try self.server_requests.append(self.allocator, .{ .id = id, .method = method });
+    }
+
+    fn allowsServerRequests(_: *TestClient) bool {
+        return true;
     }
 };
 
