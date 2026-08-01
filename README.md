@@ -90,6 +90,13 @@ mcpx skills <server> [tool]
 `mcpx servers` appends `[oauth]` to OAuth-enabled entries. Unknown options are
 rejected rather than being treated as arguments.
 
+`mcpx skills` prints a skill document, not just schemas: a preamble states how to
+reach the tools with `mcpx call <server> <tool> '<json_arguments>'`, points at
+`mcpx list`, `mcpx skills <tool>` and `mcpx auth`, and explains the JSON argument
+rules and the `6` / `7` exit codes. Every tool ends with an `### Invocation`
+block containing a runnable `mcpx call` command seeded with its required
+parameters. A `-c PATH` in effect is repeated in each printed command.
+
 ### Exit codes
 
 | Code | Meaning |

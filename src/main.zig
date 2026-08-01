@@ -176,10 +176,13 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
             try out.print("{s}\t{s}\n", .{ name, firstLine(desc) });
         }
     } else if (std.mem.eql(u8, parsed.command, "skills")) {
+        // The rendered document repeats the invocation that produced it so the
+        // reader can call the tools without guessing the CLI surface.
+        const ctx: skills.Context = .{ .server = server.name, .config = parsed.config };
         if (parsed.positionals_len > 1) {
             const tool = findTool(tools, parsed.positionals[1]) orelse return toolNotFound(parsed.positionals[1]);
-            try skills.renderTool(out, allocator, tool);
-        } else for (tools) |tool| try skills.renderTool(out, allocator, tool);
+            try skills.renderDocument(out, allocator, ctx, &.{tool});
+        } else try skills.renderDocument(out, allocator, ctx, tools);
     } else unreachable; // cli.parseArgs rejects every other command
 }
 
@@ -380,8 +383,12 @@ test "the list and skills commands render a live server" {
             // Only the first line of a description belongs in the listing.
             try std.testing.expectEqualStrings("search\tFind things\n", output.written());
         } else {
-            try std.testing.expect(std.mem.startsWith(u8, output.written(), "## search\n"));
-            try std.testing.expect(std.mem.indexOf(u8, output.written(), "**(required)**") != null);
+            const text = output.written();
+            try std.testing.expect(std.mem.startsWith(u8, text, "# MCP server `demo`\n"));
+            try std.testing.expect(std.mem.indexOf(u8, text, "## search\n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "**(required)**") != null);
+            // The document has to teach the caller how to run the tool.
+            try std.testing.expect(std.mem.indexOf(u8, text, "mcpx call demo search '{\"query\": \"...\"}'") != null);
         }
     }
 }

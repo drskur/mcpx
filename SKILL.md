@@ -107,7 +107,20 @@ mcpx skills <server>           # all tools
 mcpx skills <server> <tool>    # one tool
 ```
 
-Single-tool mode looks up the tool locally and reports `ToolNotFound` if it is absent. Output uses `## tool_name`, the description, and `### Parameters` / `### Returns` sections.
+The output is a self-contained skill document rather than a bare schema dump. It
+opens with a `# MCP server <name>` preamble that repeats the invocation used to
+produce it: the `mcpx call <server> <tool> '<json_arguments>'` form, the related
+`mcpx list` / `mcpx skills <tool>` / `mcpx auth` commands, the JSON argument
+rules, and the tool-relevant exit codes (`6` for `isError`, `7` for
+`input_required`). When `-c PATH` was supplied, every printed command repeats
+that flag so it can be copied verbatim.
+
+Each tool then gets `## tool_name`, its description, `### Parameters` and
+`### Returns` sections, and an `### Invocation` block holding a ready-to-run
+`mcpx call` command whose JSON skeleton contains the required properties filled
+with a `default`, the first `enum` member, or a per-type placeholder.
+
+Single-tool mode looks up the tool locally and reports `ToolNotFound` if it is absent.
 
 The renderer displays only these constraints: `enum`, `minLength`, `maxLength`, `minimum`, `maximum`, `pattern`, and `default`. It recursively renders nested `properties`, plus array `items` that contain `properties` or `$ref`. A `$ref` is displayed but not resolved. A definition without `properties` falls back to a raw JSON block.
 

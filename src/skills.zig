@@ -13,10 +13,63 @@ const displayScalar = json.displayScalar;
 /// of recursing as deeply as the JSON parser allows.
 const max_schema_depth: usize = 16;
 
-pub fn renderTool(out: *Io.Writer, allocator: Allocator, tool: Tool) !void {
-    try out.print("## {s}\n", .{tool.name() orelse return error.ToolMissingName});
+/// Identifies the mcpx invocation that produced a document so the rendered
+/// markdown can show commands that work as printed.
+pub const Context = struct {
+    server: []const u8,
+    /// The `-c` / `--config` path in effect, when one was supplied.
+    config: ?[]const u8 = null,
+
+    fn writePrefix(self: Context, out: *Io.Writer) !void {
+        try out.writeAll("mcpx ");
+        if (self.config) |path| try out.print("-c {s} ", .{path});
+    }
+};
+
+/// Renders one document for a whole server: a preamble that ties the tool
+/// reference back to the mcpx commands that reach it, then every tool.
+pub fn renderDocument(out: *Io.Writer, allocator: Allocator, ctx: Context, tools: []const Tool) !void {
+    try renderPreamble(out, ctx, tools.len);
+    for (tools) |tool| try renderTool(out, allocator, ctx, tool);
+}
+
+fn renderPreamble(out: *Io.Writer, ctx: Context, tool_count: usize) !void {
+    try out.print("# MCP server `{s}`\n\n", .{ctx.server});
+    if (tool_count == 0) {
+        try out.writeAll("This server advertises no tools. Re-run `");
+        try ctx.writePrefix(out);
+        try out.print("skills {s}` once it exposes some.\n", .{ctx.server});
+        return;
+    }
+    if (tool_count == 1)
+        try out.writeAll("The tool below is reached through the mcpx CLI, not through direct HTTP.\nThe call takes one JSON object argument:\n\n```sh\n")
+    else
+        try out.print("The {d} tools below are reached through the mcpx CLI, not through direct HTTP.\nEvery call takes one JSON object argument:\n\n```sh\n", .{tool_count});
+    try ctx.writePrefix(out);
+    try out.print("call {s} <tool> '<json_arguments>'\n```\n\nRelated commands:\n\n- `", .{ctx.server});
+    try ctx.writePrefix(out);
+    try out.print("list {s}` — tool names with their first description line\n- `", .{ctx.server});
+    try ctx.writePrefix(out);
+    try out.print("skills {s} <tool>` — this reference for a single tool\n- `", .{ctx.server});
+    try ctx.writePrefix(out);
+    try out.print("auth {s}` — force a fresh OAuth authorization when the server requires one\n\n", .{ctx.server});
+    try out.writeAll(
+        \\Argument rules: the JSON must arrive as a single shell argument and must be an
+        \\object; omit it to send `{}`. On success mcpx prints the server's JSON result and
+        \\exits `0`. Exit `6` means the tool ran and reported `isError`; exit `7` means the
+        \\tool needs more input.
+        \\
+        \\
+        \\
+    );
+}
+
+pub fn renderTool(out: *Io.Writer, allocator: Allocator, ctx: Context, tool: Tool) !void {
+    const name = tool.name() orelse return error.ToolMissingName;
+    try out.print("## {s}\n", .{name});
     if (tool.description()) |desc| try out.print("\n{s}\n", .{desc});
-    if (get(tool.value, "inputSchema")) |schema| {
+    const input_schema = get(tool.value, "inputSchema");
+    if (input_schema) |schema| {
         try out.writeAll("\n### Parameters\n\n");
         try renderSchema(out, allocator, schema, 0);
     }
@@ -24,7 +77,42 @@ pub fn renderTool(out: *Io.Writer, allocator: Allocator, tool: Tool) !void {
         try out.writeAll("\n### Returns\n\n");
         try renderSchema(out, allocator, schema, 0);
     }
-    try out.writeByte('\n');
+    try out.writeAll("\n### Invocation\n\n```sh\n");
+    try ctx.writePrefix(out);
+    try out.print("call {s} {s} '", .{ ctx.server, name });
+    try writeExampleArgs(out, allocator, input_schema);
+    try out.writeAll("'\n```\n\n");
+}
+
+/// Builds a skeleton argument object out of the required properties so the
+/// example is a starting point rather than a placeholder to decode.
+fn writeExampleArgs(out: *Io.Writer, allocator: Allocator, schema: ?Value) !void {
+    const actual = schema orelse return out.writeAll("{}");
+    const props = get(actual, "properties") orelse return out.writeAll("{}");
+    if (props != .object) return out.writeAll("{}");
+    try out.writeByte('{');
+    var first = true;
+    var it = props.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!isRequired(actual, key)) continue;
+        if (!first) try out.writeAll(", ");
+        first = false;
+        try out.print("\"{s}\": {s}", .{ key, try exampleValue(allocator, entry.value_ptr.*) });
+    }
+    try out.writeByte('}');
+}
+
+fn exampleValue(allocator: Allocator, schema: Value) ![]const u8 {
+    if (get(schema, "default")) |v| return json.stringify(allocator, v);
+    if (get(schema, "enum")) |values| if (values == .array and values.array.items.len != 0)
+        return json.stringify(allocator, values.array.items[0]);
+    const kind = getString(schema, "type") orelse return "null";
+    if (std.mem.eql(u8, kind, "integer") or std.mem.eql(u8, kind, "number")) return "0";
+    if (std.mem.eql(u8, kind, "boolean")) return "false";
+    if (std.mem.eql(u8, kind, "array")) return "[]";
+    if (std.mem.eql(u8, kind, "object")) return "{}";
+    return "\"...\"";
 }
 
 pub fn prettyPrint(out: *Io.Writer, value: Value) !void {
@@ -114,7 +202,7 @@ fn renderTestTool(allocator: Allocator) ![]const u8 {
         \\{"name":"search","inputSchema":{"type":"object","properties":{"kind":{"type":"string","enum":["a","b"]}},"required":["kind"]}}
     );
     var output: Io.Writer.Allocating = .init(allocator);
-    try renderTool(&output.writer, allocator, .{ .value = value });
+    try renderTool(&output.writer, allocator, .{ .server = "demo" }, .{ .value = value });
     return output.toOwnedSlice();
 }
 
@@ -137,6 +225,37 @@ test "renderTool shows enum constraints" {
     defer arena.deinit();
     const output = try renderTestTool(arena.allocator());
     try std.testing.expect(std.mem.indexOf(u8, output, "enum: a | b") != null);
+}
+
+test "renderTool includes an mcpx invocation example" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const output = try renderTestTool(arena.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Invocation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mcpx call demo search '{\"kind\": \"a\"}'") != null);
+}
+
+test "renderDocument explains the mcpx commands and honors the config flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const value = try parseTestJson(allocator, "{\"name\":\"search\"}");
+    var output: Io.Writer.Allocating = .init(allocator);
+    try renderDocument(&output.writer, allocator, .{ .server = "demo", .config = "my.toml" }, &.{.{ .value = value }});
+    const text = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, text, "# MCP server `demo`\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcpx -c my.toml list demo`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcpx -c my.toml call demo search '{}'") != null);
+}
+
+test "renderDocument reports an empty tool list without an invocation section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var output: Io.Writer.Allocating = .init(allocator);
+    try renderDocument(&output.writer, allocator, .{ .server = "demo" }, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "advertises no tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "### Invocation") == null);
 }
 
 test "prettyPrint produces indented JSON" {
