@@ -60,7 +60,6 @@ fn renderPreamble(out: *Io.Writer, ctx: Context, tool_count: usize) !void {
         \\tool needs more input.
         \\
         \\
-        \\
     );
 }
 
@@ -81,7 +80,9 @@ pub fn renderTool(out: *Io.Writer, allocator: Allocator, ctx: Context, tool: Too
     try ctx.writePrefix(out);
     try out.print("call {s} {s} '", .{ ctx.server, name });
     try writeExampleArgs(out, allocator, input_schema);
-    try out.writeAll("'\n```\n\n");
+    try out.writeAll("'\n```\n");
+    try writeOptionalSummary(out, allocator, input_schema);
+    try out.writeByte('\n');
 }
 
 /// Builds a skeleton argument object out of the required properties so the
@@ -113,6 +114,27 @@ fn exampleValue(allocator: Allocator, schema: Value) ![]const u8 {
     if (std.mem.eql(u8, kind, "array")) return "[]";
     if (std.mem.eql(u8, kind, "object")) return "{}";
     return "\"...\"";
+}
+
+/// Lists optional parameters with their type and default so the caller can
+/// tune the invocation without scrolling back to the Parameters section.
+fn writeOptionalSummary(out: *Io.Writer, allocator: Allocator, schema: ?Value) !void {
+    const actual = schema orelse return;
+    const props = get(actual, "properties") orelse return;
+    if (props != .object) return;
+    var first = true;
+    var it = props.object.iterator();
+    while (it.next()) |entry| {
+        if (isRequired(actual, entry.key_ptr.*)) continue;
+        if (first) {
+            try out.writeAll("\nOptional: ");
+            first = false;
+        } else try out.writeAll(", ");
+        try out.print("{s} ({s}", .{ entry.key_ptr.*, try schemaType(allocator, entry.value_ptr.*) });
+        if (get(entry.value_ptr.*, "default")) |v|
+            try out.print(", default {s}", .{try displayScalar(allocator, v)});
+        try out.writeByte(')');
+    }
 }
 
 pub fn prettyPrint(out: *Io.Writer, value: Value) !void {
