@@ -219,8 +219,11 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
     if (challenge) |value| if (value.resource_metadata) |url| {
         if (sameOrigin(allocator, url, endpoint)) |_|
             try candidates.append(allocator, url)
-        else |err|
-            diagnostics_out.warn("ignoring WWW-Authenticate resource_metadata '{s}': {s}\n", .{ url, @errorName(err) });
+        else |err| {
+            diagnostics_out.warn("ignoring resource_metadata challenge: origin mismatch\n", .{});
+            if (diagnostics_out.isDebug())
+                diagnostics_out.warn("resource_metadata challenge URL '{s}': {s}\n", .{ url, @errorName(err) });
+        }
     };
     try candidates.appendSlice(allocator, &fallback_candidates);
     for (candidates.items) |url| {
@@ -235,7 +238,9 @@ fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []co
         for (metadata_urls) |metadata_url| {
             const value = fetchDiscoveryJson(allocator, http, metadata_url, discovery_headers, issuer, .authorization_server) catch continue;
             return metadataFromJson(allocator, value, issuer) catch |err| {
-                diagnostics_out.warn("rejecting authorization server metadata at {s}: {s}\n", .{ metadata_url, @errorName(err) });
+                diagnostics_out.warn("rejecting authorization server metadata\n", .{});
+                if (diagnostics_out.isDebug())
+                    diagnostics_out.warn("authorization server metadata URL '{s}': {s}\n", .{ metadata_url, @errorName(err) });
                 continue;
             };
         }
