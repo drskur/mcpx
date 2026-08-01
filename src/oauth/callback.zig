@@ -123,11 +123,7 @@ fn acceptCallbackLoop(allocator: Allocator, io: Io, server: *std.Io.net.Server) 
             },
             .denied => |failure| {
                 try respond(io, stream, "400 Bad Request", failure_html);
-                diagnostics_out.report("authorization failed: {s}{s}{s}\n", .{
-                    failure.code,
-                    if (failure.description != null) ": " else "",
-                    failure.description orelse "",
-                });
+                reportAuthorizationFailure(failure, null);
                 return error.OauthAuthorizationDenied;
             },
             .ignored => {
@@ -137,6 +133,24 @@ fn acceptCallbackLoop(allocator: Allocator, io: Io, server: *std.Io.net.Server) 
         }
     }
     return error.OauthCallbackNoise;
+}
+
+fn reportAuthorizationFailure(failure: AuthorizationError, capture: ?*Io.Writer) void {
+    if (capture) |writer| {
+        writer.writeAll("authorization failed\n") catch return;
+        if (diagnostics_out.isDebug()) writer.print("authorization failure details: {s}{s}{s}\n", .{
+            failure.code,
+            if (failure.description != null) ": " else "",
+            failure.description orelse "",
+        }) catch return;
+        return;
+    }
+    diagnostics_out.report("authorization failed\n", .{});
+    if (diagnostics_out.isDebug()) diagnostics_out.report("authorization failure details: {s}{s}{s}\n", .{
+        failure.code,
+        if (failure.description != null) ": " else "",
+        failure.description orelse "",
+    });
 }
 
 fn readCallbackRequest(allocator: Allocator, io: Io, stream: std.Io.net.Stream) !CallbackRequest {
@@ -205,6 +219,17 @@ test "authorization errors are reported instead of looking like a missing code" 
     );
     try std.testing.expectEqualStrings("access_denied", request.denied.code);
     try std.testing.expectEqualStrings("user refused", request.denied.description.?);
+}
+
+test "authorization failure stderr hides remote description by default" {
+    const previous = diagnostics_out.isDebug();
+    defer diagnostics_out.setDebug(previous);
+    diagnostics_out.setDebug(false);
+    var captured: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer captured.deinit();
+    reportAuthorizationFailure(.{ .code = "access_denied", .description = "SENTINEL_DESCRIPTION" }, &captured.writer);
+    try std.testing.expectEqualStrings("authorization failed\n", captured.written());
+    try std.testing.expect(std.mem.indexOf(u8, captured.written(), "SENTINEL_DESCRIPTION") == null);
 }
 
 test "callback listener binds an ephemeral loopback port" {
