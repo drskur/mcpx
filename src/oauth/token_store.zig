@@ -23,11 +23,19 @@ pub fn validateToken(token: Token) !void {
 }
 
 fn validateHeaderTokenField(value: []const u8) !void {
-    if (value.len == 0 or value[0] == ' ' or value[0] == '\t' or
-        value[value.len - 1] == ' ' or value[value.len - 1] == '\t')
-        return error.InvalidTokenHeaderValue;
-    for (value) |byte| if (byte < 0x20 or byte == 0x7f)
-        return error.InvalidTokenHeaderValue;
+    if (value.len == 0) return error.InvalidTokenHeaderValue;
+    var padding = false;
+    for (value) |byte| {
+        if (byte == '=') {
+            padding = true;
+            continue;
+        }
+        if (padding or !(std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '-', '.', '_', '~', '+', '/' => true,
+            else => false,
+        })) return error.InvalidTokenHeaderValue;
+    }
+    if (padding and value[0] == '=') return error.InvalidTokenHeaderValue;
 }
 
 pub fn serializeTokens(allocator: Allocator, tokens: TokenStore) ![]const u8 {
@@ -189,7 +197,7 @@ test "token TOML round trip preserves fields" {
     try tokens.put(arena.allocator(), "github", .{
         .issuer = "https://issuer.example",
         .resource = "https://mcp.example/mcp",
-        .access_token = "a\"b",
+        .access_token = "a+b=",
         .refresh_token = "refresh",
         .token_type = "Bearer",
         .expires_at = 1754000000,
@@ -199,7 +207,7 @@ test "token TOML round trip preserves fields" {
     const encoded = try serializeTokens(arena.allocator(), tokens);
     var parsed = try parseTokens(arena.allocator(), encoded);
     const token = parsed.get("github").?;
-    try std.testing.expectEqualStrings("a\"b", token.access_token);
+    try std.testing.expectEqualStrings("a+b=", token.access_token);
     try std.testing.expectEqualStrings("https://issuer.example", token.issuer);
     try std.testing.expectEqualStrings("https://mcp.example/mcp", token.resource.?);
     try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
@@ -246,4 +254,12 @@ test "token file rejects unsafe authorization header values" {
         \\token_type = "Basic"
         \\
     ));
+}
+
+test "access tokens use the RFC 6750 b64token charset" {
+    const base: Token = .{ .issuer = "https://issuer.example", .access_token = "valid" };
+    try std.testing.expectError(error.InvalidTokenHeaderValue, validateToken(.{ .issuer = base.issuer, .access_token = "abc def" }));
+    try std.testing.expectError(error.InvalidTokenHeaderValue, validateToken(.{ .issuer = base.issuer, .access_token = "abc\tdef" }));
+    try std.testing.expectError(error.InvalidTokenHeaderValue, validateToken(.{ .issuer = base.issuer, .access_token = "abc\xc2\xa0def" }));
+    try validateToken(.{ .issuer = base.issuer, .access_token = "AZaz09-._~+/=" });
 }
