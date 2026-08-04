@@ -250,6 +250,8 @@ test "config parses servers via toml library" {
         \\client_id = "client"
         \\scopes = "read write"
         \\register = false
+        \\access_type_offline = true
+        \\prompt_consent = true
         \\
     );
     defer parsed_config.deinit();
@@ -259,6 +261,8 @@ test "config parses servers via toml library" {
     try std.testing.expectEqual(@as(u64, 60), config.http[1].timeoutSecs());
     try std.testing.expectEqualStrings("client", config.http[1].oauth.?.client_id.?);
     try std.testing.expectEqualStrings("read write", config.http[1].oauth.?.scopes.?);
+    try std.testing.expect(config.http[1].oauth.?.access_type_offline);
+    try std.testing.expect(config.http[1].oauth.?.prompt_consent);
     const headers = config.http[0].headers.?;
     try std.testing.expectEqualStrings("a,b", headers.map.get("X-Label").?);
 }

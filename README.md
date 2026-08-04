@@ -32,6 +32,8 @@ timeout_secs = 60
 client_id = "my-app"          # optional when register = true
 scopes = "repo read"          # optional, space-separated
 register = true               # RFC 7591 dynamic client registration
+access_type_offline = true    # optional: request a refresh token (for example, Google)
+prompt_consent = true         # optional: force re-consent so Google can reissue one
 ```
 
 The default timeout is 30 seconds; `timeout_secs = 0` is rejected. Pass
@@ -57,6 +59,12 @@ it can be opened manually. The callback state is compared in constant time, an
 authorization-server `iss` (when supplied or required) is verified before code
 exchange. Both authorization-code and refresh grants include the canonical MCP
 endpoint as RFC 8707 `resource`.
+
+For Google OAuth, set `access_type_offline = true` to add
+`access_type=offline` to the authorization URL. If Google has already recorded
+consent without issuing a refresh token, also set `prompt_consent = true` for
+the next `mcpx auth <server>` run. Both options default to `false`, and the
+standard authorization URL is unchanged unless they are enabled.
 
 Dynamic registration (`register = true`) registers a public native client with
 `token_endpoint_auth_method: none`, so no client secret has to be stored.

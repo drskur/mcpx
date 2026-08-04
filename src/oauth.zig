@@ -1,5 +1,4 @@
 const std = @import("std");
-const rpc = @import("rpc.zig");
 const pkce = @import("oauth/pkce.zig");
 const token_store = @import("oauth/token_store.zig");
 const callback = @import("oauth/callback.zig");
@@ -10,6 +9,11 @@ const Value = std.json.Value;
 
 const clock = @import("clock.zig");
 const diagnostics_out = @import("diagnostics.zig");
+const metadata_mod = @import("oauth/metadata.zig");
+const token_mod = @import("oauth/token.zig");
+const registration = @import("oauth/registration.zig");
+const oauth_url = @import("oauth/url.zig");
+const keys = @import("oauth/keys.zig");
 
 const generateVerifier = pkce.generateVerifier;
 const codeChallenge = pkce.codeChallenge;
@@ -23,9 +27,7 @@ const TokenStore = token_store.TokenStore;
 const loadTokens = token_store.loadTokens;
 const saveTokens = token_store.saveTokens;
 const tokenNeedsRefresh = token_store.tokenNeedsRefresh;
-const validateToken = token_store.validateToken;
 
-const percentDecode = callback.percentDecode;
 const bindCallback = callback.bindCallback;
 const acceptCallback = callback.acceptCallback;
 
@@ -33,22 +35,31 @@ pub const OauthConfig = struct {
     client_id: ?[]const u8 = null,
     scopes: ?[]const u8 = null,
     register: bool = false,
+    /// Request a refresh token from providers such as Google. Disabled by
+    /// default because it is not part of the general MCP OAuth profile.
+    access_type_offline: bool = false,
+    /// Force the authorization server to show its consent screen again.
+    /// Google may require this to issue a new refresh token.
+    prompt_consent: bool = false,
 };
 
-const max_metadata_size = 1024 * 1024;
+const Metadata = metadata_mod.Metadata;
+const discoverMetadata = metadata_mod.discoverMetadata;
+const metadataFromJson = metadata_mod.metadataFromJson;
+pub const validateAuthorizationIssuer = metadata_mod.validateAuthorizationIssuer;
+const exchangeCode = token_mod.exchangeCode;
+const refreshToken = token_mod.refreshToken;
+const parseTokenResponse = token_mod.parseTokenResponse;
+const fetchJson = token_mod.fetchJson;
+const tokenFromResponse = token_mod.tokenFromResponse;
+const registerClient = registration.registerClient;
+const canonicalResourceUri = oauth_url.canonicalResourceUri;
+const formField = oauth_url.formField;
+const tokenKey = keys.tokenKey;
+const tokenMatches = keys.tokenMatches;
+const findIssuerCredentials = keys.findIssuerCredentials;
 
-const Metadata = struct {
-    issuer: []const u8,
-    authorization_endpoint: []const u8,
-    token_endpoint: []const u8,
-    registration_endpoint: ?[]const u8 = null,
-    authorization_response_iss_parameter_supported: bool = false,
-};
-
-pub const OauthChallenge = struct {
-    resource_metadata: ?[]const u8 = null,
-    scope: ?[]const u8 = null,
-};
+pub const OauthChallenge = metadata_mod.Challenge;
 
 pub fn parseWwwAuthenticate(allocator: Allocator, header: []const u8) !OauthChallenge {
     const first_space = std.mem.indexOfScalar(u8, header, ' ') orelse return .{};
@@ -98,7 +109,7 @@ pub fn ensureToken(
         if (!tokenMatches(stored, metadata.issuer, resource)) return error.OauthTokenBindingMismatch;
         if (!tokenNeedsRefresh(stored, unixNow(io))) return stored;
         if (stored.refresh_token != null) {
-            const refreshed = refreshToken(allocator, http, metadata, endpoint, stored) catch null;
+            const refreshed = refreshToken(allocator, http, metadata.token_endpoint, metadata.issuer, endpoint, stored) catch null;
             if (refreshed) |token| {
                 try tokens.put(allocator, key, token);
                 try saveTokens(io, allocator, token_path, tokens);
@@ -138,7 +149,7 @@ pub fn recoverUnauthorized(
     const resource = try canonicalResourceUri(allocator, endpoint);
     const key = try tokenKey(allocator, metadata.issuer, resource);
     if (tokens.get(key)) |stored| if (tokenMatches(stored, metadata.issuer, resource) and stored.refresh_token != null) {
-        if (refreshToken(allocator, http, metadata, endpoint, stored)) |token| {
+        if (refreshToken(allocator, http, metadata.token_endpoint, metadata.issuer, endpoint, stored)) |token| {
             try tokens.put(allocator, key, token);
             try saveTokens(io, allocator, token_path, tokens);
             return token;
@@ -176,7 +187,7 @@ fn authenticateAndStore(
         }
     }
     if (config.register and client_id == null) {
-        const registered = try registerClient(allocator, http, metadata, redirect_uri);
+        const registered = try registerClient(allocator, http, metadata.registration_endpoint, redirect_uri);
         client_id = registered.client_id;
         client_secret = registered.client_secret;
     } else if (client_id == null) {
@@ -190,7 +201,7 @@ fn authenticateAndStore(
     const verifier = try generateVerifier(io, allocator);
     const challenge = try codeChallenge(allocator, verifier);
     const state = try generateState(io, allocator);
-    const auth_url = try buildAuthorizationUrl(allocator, metadata.authorization_endpoint, actual_client_id, redirect_uri, config.scopes, challenge, state, resource);
+    const auth_url = try buildAuthorizationUrl(allocator, metadata.authorization_endpoint, actual_client_id, redirect_uri, config.scopes, config.access_type_offline, config.prompt_consent, challenge, state, resource);
     openBrowser(io, auth_url);
     const received = try acceptCallback(allocator, io, &callback_server, callback.default_timeout_secs);
     if (!statesMatch(state, received.state)) return error.OauthStateMismatch;
@@ -202,230 +213,6 @@ fn authenticateAndStore(
     return token;
 }
 
-fn discoverMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []const u8, challenge: ?OauthChallenge) !Metadata {
-    const uri = try std.Uri.parse(endpoint);
-    const origin = try originUrl(allocator, uri);
-    const endpoint_path = try componentText(allocator, uri.path);
-    const fallback_candidates = [_][]const u8{
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/oauth-protected-resource{s}", .{ origin, endpoint_path }),
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/oauth-protected-resource", .{origin}),
-    };
-    const discovery_headers = &.{std.http.Header{ .name = "MCP-Protocol-Version", .value = "2026-07-28" }};
-    var issuers: []const []const u8 = &.{};
-    var candidates: std.ArrayList([]const u8) = .empty;
-    // A `WWW-Authenticate` challenge is server controlled, so its metadata URL
-    // is only followed when it stays on the resource server itself (RFC 9728
-    // section 3.3). Otherwise the server could aim discovery at any host.
-    if (challenge) |value| if (value.resource_metadata) |url| {
-        if (sameOrigin(allocator, url, endpoint)) |_|
-            try candidates.append(allocator, url)
-        else |err| {
-            diagnostics_out.warn("ignoring resource_metadata challenge: origin mismatch\n", .{});
-            if (diagnostics_out.isDebug())
-                diagnostics_out.warn("resource_metadata challenge URL '{s}': {s}\n", .{ url, @errorName(err) });
-        }
-    };
-    try candidates.appendSlice(allocator, &fallback_candidates);
-    for (candidates.items) |url| {
-        const value = fetchDiscoveryJson(allocator, http, url, discovery_headers, endpoint, .resource) catch continue;
-        issuers = try validateProtectedResourceMetadata(allocator, value, endpoint);
-        break;
-    }
-    if (issuers.len == 0) return error.OauthProtectedResourceMetadataDiscoveryFailed;
-    // Every advertised authorization server is tried in order before failing.
-    for (issuers) |issuer| {
-        const metadata_urls = try authorizationMetadataUrls(allocator, issuer);
-        for (metadata_urls) |metadata_url| {
-            const value = fetchDiscoveryJson(allocator, http, metadata_url, discovery_headers, issuer, .authorization_server) catch continue;
-            return metadataFromJson(allocator, value, issuer) catch |err| {
-                diagnostics_out.warn("rejecting authorization server metadata\n", .{});
-                if (diagnostics_out.isDebug())
-                    diagnostics_out.warn("authorization server metadata URL '{s}': {s}\n", .{ metadata_url, @errorName(err) });
-                continue;
-            };
-        }
-    }
-    return error.OauthMetadataDiscoveryFailed;
-}
-
-fn metadataFromJson(allocator: Allocator, value: Value, expected_issuer: []const u8) !Metadata {
-    const issuer = rpc.getString(value, "issuer") orelse return error.OauthMetadataMissingIssuer;
-    if (!std.mem.eql(u8, issuer, expected_issuer)) return error.OauthIssuerMismatch;
-    const authorization_endpoint = rpc.getString(value, "authorization_endpoint") orelse return error.OauthMetadataMissingAuthorizationEndpoint;
-    const token_endpoint = rpc.getString(value, "token_endpoint") orelse return error.OauthMetadataMissingTokenEndpoint;
-    const registration_endpoint = rpc.getString(value, "registration_endpoint");
-    const response_iss_supported = if (rpc.get(value, "authorization_response_iss_parameter_supported")) |supported| switch (supported) {
-        .bool => supported.bool,
-        else => return error.OauthMetadataInvalidAuthorizationResponseIssuerSupport,
-    } else false;
-    // Credentials and codes must never travel over cleartext HTTP.
-    try requireSecureUrl(allocator, authorization_endpoint);
-    try requireSecureUrl(allocator, token_endpoint);
-    if (registration_endpoint) |url| try requireSecureUrl(allocator, url);
-    return .{
-        .issuer = issuer,
-        .authorization_endpoint = authorization_endpoint,
-        .token_endpoint = token_endpoint,
-        .registration_endpoint = registration_endpoint,
-        .authorization_response_iss_parameter_supported = response_iss_supported,
-    };
-}
-
-/// Accepts `https` URLs, plus `http` on loopback hosts for local development.
-fn requireSecureUrl(allocator: Allocator, url: []const u8) !void {
-    const uri = std.Uri.parse(url) catch return error.OauthInsecureUrl;
-    const host = try componentText(allocator, uri.host orelse return error.OauthInsecureUrl);
-    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.OauthInsecureUrl;
-    if (isLoopbackHost(host)) return;
-    return error.OauthInsecureUrl;
-}
-
-fn isLoopbackHost(host: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
-    if (std.mem.eql(u8, host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
-    return std.mem.startsWith(u8, host, "127.");
-}
-
-fn sameOrigin(allocator: Allocator, url: []const u8, endpoint: []const u8) !void {
-    const candidate = std.Uri.parse(url) catch return error.OauthChallengeInvalidUrl;
-    const expected = try std.Uri.parse(endpoint);
-    if (!std.ascii.eqlIgnoreCase(candidate.scheme, expected.scheme)) return error.OauthChallengeOriginMismatch;
-    const candidate_host = try componentText(allocator, candidate.host orelse return error.OauthChallengeInvalidUrl);
-    const expected_host = try componentText(allocator, expected.host orelse return error.OauthEndpointMissingHost);
-    if (!std.ascii.eqlIgnoreCase(candidate_host, expected_host)) return error.OauthChallengeOriginMismatch;
-    if (defaultedPort(candidate) != defaultedPort(expected)) return error.OauthChallengeOriginMismatch;
-}
-
-fn defaultedPort(uri: std.Uri) u16 {
-    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
-}
-
-fn registerClient(allocator: Allocator, http: *std.http.Client, metadata: Metadata, redirect_uri: []const u8) !Registration {
-    const url = metadata.registration_endpoint orelse return error.OauthRegistrationUnsupported;
-    var payload = Value{ .object = .empty };
-    try payload.object.put(allocator, "client_name", .{ .string = "mcpx" });
-    try payload.object.put(allocator, "application_type", .{ .string = "native" });
-    try payload.object.put(allocator, "redirect_uris", try stringArray(allocator, &.{redirect_uri}));
-    try payload.object.put(allocator, "grant_types", try stringArray(allocator, &.{ "authorization_code", "refresh_token" }));
-    try payload.object.put(allocator, "response_types", try stringArray(allocator, &.{"code"}));
-    // A CLI is a public client: PKCE replaces client authentication, so no
-    // secret has to be stored on disk (RFC 8252 section 8.4, OAuth 2.1).
-    try payload.object.put(allocator, "token_endpoint_auth_method", .{ .string = "none" });
-    const body = try rpc.jsonString(allocator, payload);
-    const value = try fetchJson(allocator, http, .POST, url, body, &.{.{ .name = "Content-Type", .value = "application/json" }});
-    return .{
-        .client_id = rpc.getString(value, "client_id") orelse return error.OauthRegistrationMissingClientId,
-        .client_secret = rpc.getString(value, "client_secret"),
-    };
-}
-
-fn exchangeCode(allocator: Allocator, http: *std.http.Client, token_endpoint: []const u8, code: []const u8, verifier: []const u8, redirect_uri: []const u8, client_id: []const u8, client_secret: ?[]const u8, resource: []const u8) !TokenResponse {
-    var form: Io.Writer.Allocating = .init(allocator);
-    defer form.deinit();
-    try formField(&form.writer, "grant_type", "authorization_code", false);
-    try formField(&form.writer, "code", code, true);
-    try formField(&form.writer, "code_verifier", verifier, true);
-    try formField(&form.writer, "redirect_uri", redirect_uri, true);
-    try formField(&form.writer, "client_id", client_id, true);
-    try formField(&form.writer, "resource", resource, true);
-    if (client_secret) |secret| try formField(&form.writer, "client_secret", secret, true);
-    return parseTokenResponse(try fetchJson(allocator, http, .POST, token_endpoint, form.written(), &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }}));
-}
-
-fn refreshToken(allocator: Allocator, http: *std.http.Client, metadata: Metadata, endpoint: []const u8, old: Token) !Token {
-    const resource = try canonicalResourceUri(allocator, endpoint);
-    var form: Io.Writer.Allocating = .init(allocator);
-    defer form.deinit();
-    try formField(&form.writer, "grant_type", "refresh_token", false);
-    try formField(&form.writer, "refresh_token", old.refresh_token.?, true);
-    try formField(&form.writer, "client_id", old.client_id orelse return error.OauthClientIdRequired, true);
-    try formField(&form.writer, "resource", resource, true);
-    if (old.client_secret) |secret| try formField(&form.writer, "client_secret", secret, true);
-    const parsed = try parseTokenResponse(try fetchJson(allocator, http, .POST, metadata.token_endpoint, form.written(), &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }}));
-    return .{
-        .issuer = metadata.issuer,
-        .resource = resource,
-        .access_token = parsed.access_token,
-        .refresh_token = parsed.refresh_token orelse old.refresh_token,
-        .token_type = parsed.token_type,
-        .expires_at = if (parsed.expires_in) |seconds| unixNow(http.io) + seconds else null,
-        .client_id = old.client_id,
-        .client_secret = old.client_secret,
-    };
-}
-
-fn parseTokenResponse(value: Value) !TokenResponse {
-    const response: TokenResponse = .{
-        .access_token = rpc.getString(value, "access_token") orelse return error.OauthTokenMissingAccessToken,
-        .refresh_token = rpc.getString(value, "refresh_token"),
-        .token_type = rpc.getString(value, "token_type") orelse "Bearer",
-        .expires_in = rpc.getInteger(value, "expires_in"),
-    };
-    try validateToken(.{ .issuer = "", .access_token = response.access_token, .token_type = response.token_type });
-    return response;
-}
-
-fn tokenFromResponse(response: TokenResponse, issuer: []const u8, resource: []const u8, client_id: []const u8, client_secret: ?[]const u8, now: i64) Token {
-    return .{
-        .issuer = issuer,
-        .resource = resource,
-        .access_token = response.access_token,
-        .refresh_token = response.refresh_token,
-        .token_type = response.token_type,
-        .expires_at = if (response.expires_in) |seconds| now + seconds else null,
-        .client_id = client_id,
-        .client_secret = client_secret,
-    };
-}
-
-fn tokenKey(allocator: Allocator, issuer: []const u8, resource: []const u8) ![]const u8 {
-    const raw = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ issuer, resource });
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
-    const result = try allocator.alloc(u8, "token-".len + encoded_len);
-    @memcpy(result[0.."token-".len], "token-");
-    _ = std.base64.url_safe_no_pad.Encoder.encode(result["token-".len..], raw);
-    return result;
-}
-
-fn tokenMatches(token: Token, issuer: []const u8, resource: []const u8) bool {
-    return std.mem.eql(u8, token.issuer, issuer) and
-        token.resource != null and std.mem.eql(u8, token.resource.?, resource);
-}
-
-fn findIssuerCredentials(tokens: TokenStore, issuer: []const u8) ?Token {
-    var iterator = tokens.iterator();
-    while (iterator.next()) |entry|
-        if (std.mem.eql(u8, entry.value_ptr.issuer, issuer) and entry.value_ptr.client_id != null)
-            return entry.value_ptr.*;
-    return null;
-}
-
-fn canonicalResourceUri(allocator: Allocator, input: []const u8) ![]const u8 {
-    var uri = try std.Uri.parse(input);
-    if (uri.host == null or uri.fragment != null) return error.OauthInvalidResourceUri;
-    uri.scheme = try std.ascii.allocLowerString(allocator, uri.scheme);
-    const host = try componentText(allocator, uri.host.?);
-    uri.host = .{ .raw = try std.ascii.allocLowerString(allocator, host) };
-    if ((std.mem.eql(u8, uri.scheme, "https") and uri.port == 443) or
-        (std.mem.eql(u8, uri.scheme, "http") and uri.port == 80))
-        uri.port = null;
-    var output: Io.Writer.Allocating = .init(allocator);
-    try uri.writeToStream(&output.writer, .{
-        .scheme = true,
-        .authentication = true,
-        .authority = true,
-        .path = true,
-        .query = true,
-        .fragment = false,
-        .port = true,
-    });
-    const canonical = try output.toOwnedSlice();
-    if (uri.path.isEmpty() and uri.query == null and canonical.len > 0 and canonical[canonical.len - 1] == '/')
-        return canonical[0 .. canonical.len - 1];
-    return canonical;
-}
-
 fn openBrowser(io: Io, url: []const u8) void {
     diagnostics_out.report("Open this URL to authorize mcpx:\n{s}\n", .{url});
     if (@import("builtin").os.tag == .linux) {
@@ -434,7 +221,7 @@ fn openBrowser(io: Io, url: []const u8) void {
     }
 }
 
-fn buildAuthorizationUrl(allocator: Allocator, endpoint: []const u8, client_id: []const u8, redirect_uri: []const u8, scopes: ?[]const u8, challenge: []const u8, state: []const u8, resource: []const u8) ![]const u8 {
+fn buildAuthorizationUrl(allocator: Allocator, endpoint: []const u8, client_id: []const u8, redirect_uri: []const u8, scopes: ?[]const u8, access_type_offline: bool, prompt_consent: bool, challenge: []const u8, state: []const u8, resource: []const u8) ![]const u8 {
     var output: Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeAll(endpoint);
@@ -443,206 +230,13 @@ fn buildAuthorizationUrl(allocator: Allocator, endpoint: []const u8, client_id: 
     try formField(&output.writer, "client_id", client_id, true);
     try formField(&output.writer, "redirect_uri", redirect_uri, true);
     if (scopes) |value| try formField(&output.writer, "scope", value, true);
+    if (access_type_offline) try formField(&output.writer, "access_type", "offline", true);
+    if (prompt_consent) try formField(&output.writer, "prompt", "consent", true);
     try formField(&output.writer, "code_challenge", challenge, true);
     try formField(&output.writer, "code_challenge_method", "S256", true);
     try formField(&output.writer, "state", state, true);
     try formField(&output.writer, "resource", resource, true);
     return output.toOwnedSlice();
-}
-
-fn authorizationMetadataUrls(allocator: Allocator, issuer: []const u8) ![]const []const u8 {
-    const uri = try std.Uri.parse(issuer);
-    const origin = try originUrl(allocator, uri);
-    const path = std.mem.trim(u8, try componentText(allocator, uri.path), "/");
-    var urls: std.ArrayList([]const u8) = .empty;
-    try urls.append(allocator, if (path.len == 0)
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/oauth-authorization-server", .{origin})
-    else
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/oauth-authorization-server/{s}", .{ origin, path }));
-    try urls.append(allocator, if (path.len == 0)
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/openid-configuration", .{origin})
-    else
-        try std.fmt.allocPrint(allocator, "{s}/.well-known/openid-configuration/{s}", .{ origin, path }));
-    if (path.len != 0) try urls.append(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}/.well-known/openid-configuration", .{ origin, path }));
-    return urls.toOwnedSlice(allocator);
-}
-
-pub fn validateAuthorizationIssuer(expected: []const u8, received: ?[]const u8, advertised: bool) !void {
-    const issuer = received orelse {
-        if (advertised) return error.OauthAuthorizationIssuerMissing;
-        return;
-    };
-    if (!std.mem.eql(u8, expected, issuer)) return error.OauthAuthorizationIssuerMismatch;
-}
-
-fn validateProtectedResourceMetadata(allocator: Allocator, value: Value, endpoint: []const u8) ![]const []const u8 {
-    if (value != .object) return error.OauthProtectedResourceMetadataMustBeObject;
-    const resource = rpc.getString(value, "resource") orelse return error.OauthProtectedResourceMetadataMissingResource;
-    const expected_resource = try canonicalResourceUri(allocator, endpoint);
-    const actual_resource = try canonicalResourceUri(allocator, resource);
-    if (!std.mem.eql(u8, expected_resource, actual_resource)) return error.OauthResourceMismatch;
-    const servers = rpc.get(value, "authorization_servers") orelse
-        return error.OauthProtectedResourceMetadataMissingAuthorizationServers;
-    if (servers != .array or servers.array.items.len == 0)
-        return error.OauthProtectedResourceMetadataMissingAuthorizationServers;
-    var issuers: std.ArrayList([]const u8) = .empty;
-    for (servers.array.items) |server| {
-        if (server != .string or server.string.len == 0)
-            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
-        const issuer = std.Uri.parse(server.string) catch
-            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
-        if (issuer.host == null or issuer.fragment != null)
-            return error.OauthProtectedResourceMetadataInvalidAuthorizationServer;
-        requireSecureUrl(allocator, server.string) catch
-            return error.OauthProtectedResourceMetadataInsecureAuthorizationServer;
-        try issuers.append(allocator, server.string);
-    }
-    return issuers.toOwnedSlice(allocator);
-}
-
-fn fetchJson(allocator: Allocator, http: *std.http.Client, method: std.http.Method, url: []const u8, payload: ?[]const u8, headers: []const std.http.Header) !Value {
-    // A fixed buffer caps what a remote server can make mcpx allocate; OAuth
-    // metadata and token responses are far smaller than this.
-    const buffer = try allocator.alloc(u8, max_metadata_size);
-    var output: Io.Writer = .fixed(buffer);
-    const response = http.fetch(.{
-        .location = .{ .url = url },
-        .method = method,
-        .payload = payload,
-        .response_writer = &output,
-        .extra_headers = headers,
-    }) catch |err| switch (err) {
-        error.WriteFailed => return error.OauthResponseTooLarge,
-        else => return err,
-    };
-    const body = output.buffered();
-    if (response.status.class() != .success) {
-        reportOauthFailure(allocator, url, response.status, body);
-        return error.OauthHttpRequestFailed;
-    }
-    return rpc.parseJson(allocator, body);
-}
-
-const DiscoveryPolicy = enum { resource, authorization_server };
-const max_discovery_redirects = 8;
-
-fn fetchDiscoveryJson(allocator: Allocator, http: *std.http.Client, initial_url: []const u8, headers: []const std.http.Header, policy_url: []const u8, policy: DiscoveryPolicy) !Value {
-    var current = initial_url;
-    var visited: std.StringHashMapUnmanaged(void) = .empty;
-    defer visited.deinit(allocator);
-    var redirects: usize = 0;
-    while (true) {
-        if (visited.contains(current)) return error.OauthDiscoveryRedirectLoop;
-        try visited.put(allocator, try allocator.dupe(u8, current), {});
-        try validateDiscoveryUrl(allocator, current, policy_url, policy);
-
-        const uri = std.Uri.parse(current) catch return error.OauthDiscoveryRedirectInvalidUrl;
-        var request = try http.request(.GET, uri, .{ .extra_headers = headers, .redirect_behavior = .unhandled });
-        errdefer request.deinit();
-        try request.sendBodiless();
-        var response = try request.receiveHead(&.{});
-        if (response.head.status.class() == .redirect) {
-            const location = response.head.location orelse return error.OauthDiscoveryRedirectMissingLocation;
-            if (redirects == max_discovery_redirects) return error.OauthDiscoveryTooManyRedirects;
-            current = try resolveRedirectUrl(allocator, current, location);
-            redirects += 1;
-            request.deinit();
-            continue;
-        }
-        var transfer_buffer: [64]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
-        const buffer = try allocator.alloc(u8, max_metadata_size + 1);
-        var output: Io.Writer = .fixed(buffer);
-        _ = reader.stream(&output, .limited(max_metadata_size + 1)) catch |err| switch (err) {
-            error.EndOfStream => {},
-            else => return err,
-        };
-        const body = output.buffered();
-        if (body.len > max_metadata_size) return error.OauthResponseTooLarge;
-        if (response.head.status.class() != .success) {
-            reportOauthFailure(allocator, current, response.head.status, body);
-            request.deinit();
-            return error.OauthHttpRequestFailed;
-        }
-        const value = try rpc.parseJson(allocator, body);
-        request.deinit();
-        return value;
-    }
-}
-
-fn validateDiscoveryUrl(allocator: Allocator, url: []const u8, policy_url: []const u8, policy: DiscoveryPolicy) !void {
-    sameOrigin(allocator, url, policy_url) catch return error.OauthDiscoveryRedirectPolicyViolation;
-    if (policy == .authorization_server) try requireSecureUrl(allocator, url);
-}
-
-fn resolveRedirectUrl(allocator: Allocator, base_url: []const u8, location: []const u8) ![]const u8 {
-    if (location.len == 0) return error.OauthDiscoveryRedirectInvalidUrl;
-    if (std.mem.startsWith(u8, location, "https://") or std.mem.startsWith(u8, location, "http://"))
-        return allocator.dupe(u8, location);
-    if (std.mem.indexOfScalar(u8, location, ':')) |colon| {
-        const slash = std.mem.indexOfScalar(u8, location, '/') orelse location.len;
-        if (colon < slash) return error.OauthDiscoveryRedirectInvalidUrl;
-    }
-    if (std.mem.startsWith(u8, location, "//")) return error.OauthDiscoveryRedirectInvalidUrl;
-    const base = std.Uri.parse(base_url) catch return error.OauthDiscoveryRedirectInvalidUrl;
-    const origin = try originUrl(allocator, base);
-    if (location[0] == '/') return std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, location });
-    const path = try componentText(allocator, base.path);
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.OauthDiscoveryRedirectInvalidUrl;
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ origin, path[0 .. slash + 1], location });
-}
-
-/// Surfaces the RFC 6749 section 5.2 error body instead of discarding it.
-fn reportOauthFailure(allocator: Allocator, url: []const u8, status: std.http.Status, body: []const u8) void {
-    diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: remote request failed\n", .{ url, @intFromEnum(status) });
-    if (!diagnostics_out.isDebug()) return;
-    const displayed = body[0..@min(body.len, 512)];
-    if (rpc.parseJson(allocator, body)) |value| {
-        if (rpc.getString(value, "error")) |code| {
-            diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: {s}{s}{s}\n", .{
-                url,
-                @intFromEnum(status),
-                code,
-                if (rpc.getString(value, "error_description") != null) ": " else "",
-                rpc.getString(value, "error_description") orelse "",
-            });
-            return;
-        }
-    } else |_| {}
-    diagnostics_out.report("OAuth request to {s} failed: HTTP {d}: {s}\n", .{ url, @intFromEnum(status), displayed });
-}
-
-fn originUrl(allocator: Allocator, uri: std.Uri) ![]const u8 {
-    const scheme = uri.scheme;
-    const host = try componentText(allocator, uri.host orelse return error.OauthEndpointMissingHost);
-    const port = if (uri.port) |value| try std.fmt.allocPrint(allocator, ":{d}", .{value}) else "";
-    return std.fmt.allocPrint(allocator, "{s}://{s}{s}", .{ scheme, host, port });
-}
-
-fn componentText(allocator: Allocator, component: std.Uri.Component) ![]const u8 {
-    return switch (component) {
-        .raw => |value| value,
-        .percent_encoded => |value| percentDecode(allocator, value),
-    };
-}
-
-fn formField(writer: *Io.Writer, name: []const u8, value: []const u8, separator: bool) !void {
-    if (separator) try writer.writeByte('&');
-    try writer.writeAll(name);
-    try writer.writeByte('=');
-    for (value) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or byte == '_' or byte == '~')
-            try writer.writeByte(byte)
-        else
-            try writer.print("%{X:0>2}", .{byte});
-    }
-}
-
-fn stringArray(allocator: Allocator, values: []const []const u8) !Value {
-    var array = Value{ .array = .init(allocator) };
-    for (values) |value| try array.array.append(.{ .string = value });
-    return array;
 }
 
 test "authorization response issuer follows metadata advertisement" {
@@ -680,227 +274,27 @@ test "WWW-Authenticate parser preserves resource metadata and scope" {
     try std.testing.expectEqualStrings("tools read", challenge.scope.?);
 }
 
-test "authorization metadata well-known URLs preserve issuer paths" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const urls = try authorizationMetadataUrls(arena.allocator(), "https://issuer.example/tenant/a");
-    try std.testing.expectEqualStrings("https://issuer.example/.well-known/oauth-authorization-server/tenant/a", urls[0]);
-    try std.testing.expectEqualStrings("https://issuer.example/.well-known/openid-configuration/tenant/a", urls[1]);
-    try std.testing.expectEqualStrings("https://issuer.example/tenant/a/.well-known/openid-configuration", urls[2]);
-}
-
-test "protected resource metadata requires resource binding and authorization servers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const endpoint = "https://mcp.example/mcp";
-    const non_object = try std.json.parseFromSliceLeaky(Value, allocator, "[]", .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataMustBeObject,
-        validateProtectedResourceMetadata(allocator, non_object, endpoint),
-    );
-    const valid = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"HTTPS://MCP.EXAMPLE:443/mcp","authorization_servers":["https://issuer.example"]}
-    , .{});
-    try std.testing.expectEqualStrings(
-        "https://issuer.example",
-        (try validateProtectedResourceMetadata(allocator, valid, endpoint))[0],
-    );
-    const missing_resource = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"authorization_servers":["https://issuer.example"]}
-    , .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataMissingResource,
-        validateProtectedResourceMetadata(allocator, missing_resource, endpoint),
-    );
-    const mismatch = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://other.example/mcp","authorization_servers":["https://issuer.example"]}
-    , .{});
-    try std.testing.expectError(error.OauthResourceMismatch, validateProtectedResourceMetadata(allocator, mismatch, endpoint));
-    const missing_servers = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://mcp.example/mcp"}
-    , .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataMissingAuthorizationServers,
-        validateProtectedResourceMetadata(allocator, missing_servers, endpoint),
-    );
-    const empty_servers = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://mcp.example/mcp","authorization_servers":[]}
-    , .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataMissingAuthorizationServers,
-        validateProtectedResourceMetadata(allocator, empty_servers, endpoint),
-    );
-    const invalid_server = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://mcp.example/mcp","authorization_servers":["relative"]}
-    , .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataInvalidAuthorizationServer,
-        validateProtectedResourceMetadata(allocator, invalid_server, endpoint),
-    );
-}
-
-test "authorization and refresh token forms include resource" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var code_form: Io.Writer.Allocating = .init(arena.allocator());
-    try formField(&code_form.writer, "grant_type", "authorization_code", false);
-    try formField(&code_form.writer, "resource", "https://mcp.example/mcp", true);
-    try std.testing.expect(std.mem.indexOf(u8, code_form.written(), "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
-    var refresh_form: Io.Writer.Allocating = .init(arena.allocator());
-    try formField(&refresh_form.writer, "grant_type", "refresh_token", false);
-    try formField(&refresh_form.writer, "resource", "https://mcp.example/mcp", true);
-    try std.testing.expect(std.mem.indexOf(u8, refresh_form.written(), "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
-}
-
-test "tokens are keyed and verified by issuer and canonical resource" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const issuer = "https://issuer.example";
-    const first = try canonicalResourceUri(allocator, "HTTPS://MCP.EXAMPLE:443/mcp");
-    const same = try canonicalResourceUri(allocator, "https://mcp.example/mcp");
-    const different = try canonicalResourceUri(allocator, "https://mcp.example/other");
-    try std.testing.expectEqualStrings(first, same);
-    try std.testing.expectEqualStrings(
-        try tokenKey(allocator, issuer, first),
-        try tokenKey(allocator, issuer, same),
-    );
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        try tokenKey(allocator, issuer, first),
-        try tokenKey(allocator, issuer, different),
-    ));
-    const token: Token = .{ .issuer = issuer, .resource = first, .access_token = "bound" };
-    try std.testing.expect(tokenMatches(token, issuer, same));
-    try std.testing.expect(!tokenMatches(token, issuer, different));
-    try std.testing.expect(!tokenMatches(.{ .issuer = issuer, .access_token = "legacy" }, issuer, same));
-}
-
-test "authorization server metadata must not use cleartext endpoints" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const insecure_token = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"issuer":"https://issuer.example","authorization_endpoint":"https://issuer.example/auth","token_endpoint":"http://issuer.example/token"}
-    , .{});
-    try std.testing.expectError(
-        error.OauthInsecureUrl,
-        metadataFromJson(allocator, insecure_token, "https://issuer.example"),
-    );
-    const loopback = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"issuer":"http://127.0.0.1:8080","authorization_endpoint":"http://127.0.0.1:8080/auth","token_endpoint":"http://127.0.0.1:8080/token"}
-    , .{});
-    const metadata = try metadataFromJson(allocator, loopback, "http://127.0.0.1:8080");
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/token", metadata.token_endpoint);
-}
-
-test "protected resource metadata rejects cleartext authorization servers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const insecure = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://mcp.example/mcp","authorization_servers":["http://issuer.example"]}
-    , .{});
-    try std.testing.expectError(
-        error.OauthProtectedResourceMetadataInsecureAuthorizationServer,
-        validateProtectedResourceMetadata(allocator, insecure, "https://mcp.example/mcp"),
-    );
-}
-
-test "protected resource metadata keeps every authorization server candidate" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const value = try std.json.parseFromSliceLeaky(Value, allocator,
-        \\{"resource":"https://mcp.example/mcp","authorization_servers":["https://one.example","https://two.example"]}
-    , .{});
-    const issuers = try validateProtectedResourceMetadata(allocator, value, "https://mcp.example/mcp");
-    try std.testing.expectEqual(@as(usize, 2), issuers.len);
-    try std.testing.expectEqualStrings("https://two.example", issuers[1]);
-}
-
-test "challenge metadata URLs are confined to the resource server origin" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const endpoint = "https://mcp.example/mcp";
-    try sameOrigin(allocator, "https://mcp.example/.well-known/oauth-protected-resource/mcp", endpoint);
-    try sameOrigin(allocator, "https://mcp.example:443/other", endpoint);
-    try std.testing.expectError(
-        error.OauthChallengeOriginMismatch,
-        sameOrigin(allocator, "https://attacker.example/metadata", endpoint),
-    );
-    try std.testing.expectError(
-        error.OauthChallengeOriginMismatch,
-        sameOrigin(allocator, "http://mcp.example/metadata", endpoint),
-    );
-    try std.testing.expectError(
-        error.OauthChallengeOriginMismatch,
-        sameOrigin(allocator, "https://mcp.example:8443/metadata", endpoint),
-    );
-    try std.testing.expectError(
-        error.OauthChallengeInvalidUrl,
-        sameOrigin(allocator, "not-a-url", endpoint),
-    );
-}
-
-test "discovery redirect policy rejects cross-origin and scheme changes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    try validateDiscoveryUrl(allocator, "https://mcp.example/next", "https://mcp.example/mcp", .resource);
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://attacker.example/next", "https://mcp.example/mcp", .resource));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "http://mcp.example/next", "https://mcp.example/mcp", .resource));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://127.0.0.1/next", "https://issuer.example", .authorization_server));
-    try std.testing.expectError(error.OauthDiscoveryRedirectPolicyViolation, validateDiscoveryUrl(allocator, "https://10.0.0.1/next", "https://issuer.example", .authorization_server));
-}
-
-test "discovery follows safe relative redirects and rejects loops" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const io = std.testing.io;
-    const test_http = @import("test_http.zig");
-
-    var server = try test_http.listenLoopback(io);
-    defer server.deinit(io);
-    const origin = try test_http.originFor(allocator, &server);
-    const start = try std.fmt.allocPrint(allocator, "{s}/metadata/start", .{origin});
-    var script = test_http.Script{ .keep_alive = true, .responses = &.{
-        .{ .status = "302 Found", .extra_headers = "Location: next\r\n", .body = "" },
-        .{ .status = "200 OK", .body = "{\"ok\":true}" },
-    } };
-    var serving = try io.concurrent(test_http.Script.serve, .{ &script, io, &server });
-    var http: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer http.deinit();
-    const value = try fetchDiscoveryJson(allocator, &http, start, &.{}, origin, .resource);
-    try serving.await(io);
-    try std.testing.expect(rpc.get(value, "ok").?.bool);
-    try std.testing.expect(std.mem.indexOf(u8, script.request(1), "/metadata/next") != null);
-
-    var loop_server = try test_http.listenLoopback(io);
-    defer loop_server.deinit(io);
-    const loop_origin = try test_http.originFor(allocator, &loop_server);
-    const loop_url = try std.fmt.allocPrint(allocator, "{s}/a", .{loop_origin});
-    var loop_script = test_http.Script{ .keep_alive = true, .responses = &.{
-        .{ .status = "302 Found", .extra_headers = "Location: /b\r\n", .body = "" },
-        .{ .status = "302 Found", .extra_headers = "Location: /a\r\n", .body = "" },
-    } };
-    var loop_serving = try io.concurrent(test_http.Script.serve, .{ &loop_script, io, &loop_server });
-    try std.testing.expectError(error.OauthDiscoveryRedirectLoop, fetchDiscoveryJson(allocator, &http, loop_url, &.{}, loop_origin, .resource));
-    try loop_serving.await(io);
-}
-
 test "authorization URL and token forms carry the canonical resource" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const resource = try canonicalResourceUri(allocator, "HTTPS://MCP.EXAMPLE:443/mcp");
     try std.testing.expectEqualStrings("https://mcp.example/mcp", resource);
-    const url = try buildAuthorizationUrl(allocator, "https://issuer.example/auth", "client", "http://127.0.0.1:1/callback", null, "challenge", "state", resource);
+    const url = try buildAuthorizationUrl(allocator, "https://issuer.example/auth", "client", "http://127.0.0.1:1/callback", null, false, false, "challenge", "state", resource);
     try std.testing.expect(std.mem.indexOf(u8, url, "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "MCP.EXAMPLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "access_type=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "prompt=") == null);
+}
+
+test "authorization URL supports opt-in Google refresh token parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const url = try buildAuthorizationUrl(arena.allocator(), "https://accounts.google.com/o/oauth2/v2/auth", "client", "http://127.0.0.1:1/callback", "openid email", true, true, "challenge", "state", "https://mcp.example/mcp");
+    try std.testing.expect(std.mem.indexOf(u8, url, "scope=openid%20email") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "access_type=offline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "prompt=consent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "resource=https%3A%2F%2Fmcp.example%2Fmcp") != null);
 }
 
 test "a stored refresh token is exchanged over real HTTP and persisted" {
