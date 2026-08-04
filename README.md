@@ -145,3 +145,59 @@ zig fmt --check src build.zig
 Tool listings skip entries without a name and duplicate names, tool schema
 rendering is depth bounded, and responses are capped at 16 MiB (1 MiB for OAuth
 metadata) so a hostile server cannot exhaust memory.
+
+## CLI vs MCP: further reading
+
+mcpx is a CLI bridge for MCP HTTP servers, which sits at the intersection of the
+CLI-first vs MCP debate. The trade-offs are covered in the primary sources below
+(summaries are the author's own; the linked posts are the authoritative text).
+
+- **Mario Zechner (Pi agent creator) — "Benchmarking Tools for Coding Agents"**
+  https://mariozechner.at/posts/2025-08-15-mcp-vs-cli/
+  Directly benchmarked MCP vs CLI (120 runs, 3 tasks × 4 tools × 10 reps).
+  Both hit 100% success; MCP was 23% faster and 2.5% cheaper. His core point:
+  many MCPs are thin wrappers over existing CLIs (e.g. GitHub MCP vs `gh`), and a
+  well-designed, token-efficient CLI is simpler and pipeable — add an MCP server
+  on top of a good CLI only when you need it.
+
+- **Lalatendu Swain — "Why CLIs Beat MCP for AI Agents — and How to Build Your Own CLI Army"**
+  https://lalatenduswain.medium.com/why-clis-beat-mcp-for-ai-agents-and-how-to-build-your-own-cli-army-8db9e0467dd8
+  Argues CLI wins on token efficiency (LM already knows Unix commands from training,
+  no schema injection), Unix composability (pipe/filter only sends relevant output),
+  and simplicity. Cites shell-based approaches showing 5–10x better token efficiency.
+
+- **girma35 — "CLI-Agent vs MCP: A Practical Comparison"**
+  https://dev.to/girma35/cli-agent-vs-mcp-a-practical-comparison-for-students-startups-and-developers-4com
+  Recommends starting with CLI agents for prototyping/learning (faster iteration,
+  lower cost, human legibility, inspectable output), and only adding MCP where
+  reliability or shared standards demand it.
+
+- **Firecrawl — "MCP vs CLI: Which One Should You Use in 2026?"**
+  https://www.firecrawl.dev/blog/mcp-vs-cli
+  Notes Peter Steinberger (OpenClaw) framed CLI as an ergonomics preference, not a
+  capability gap. CLI wins on token efficiency for personal agents; MCP earns its
+  complexity for OAuth per-user, multi-tenant, and enterprise audit-tail needs.
+
+- **Tobias Pfuetze — "The MCP vs. CLI Debate Is the Wrong Fight"**
+  https://medium.com/@tobias_pfuetze/the-mcp-vs-cli-debate-is-the-wrong-fight-a87f1b4c8006
+  For a personal agent on your own machine, CLI-first is clearly superior
+  (direct system access, zero abstraction overhead). MCP matters for distribution,
+  discoverability, and enterprise governance — support both, let context decide.
+
+- **Akshay Chame — "MCP vs CLI vs CLI+Skills: Trade-offs, Use Cases, and Best Practices"**
+  https://medium.com/@akshaychame2/mcp-vs-cli-vs-cli-skills-trade-offs-use-cases-and-best-practices-49b9cfd7a556
+  "CLI+Skills" is the underrated middle ground: the terminal's operational reality
+  plus the repeatability agents need, without turning every workflow into a
+  formal protocol. Use the lightest interface that gives enough reliability.
+
+- **Latenode — "MCP vs CLI for AI Agents: Which One Should You Use?"**
+  https://latenode.com/blog/mcp-vs-cli-ai-agents
+  CLI is the better default for most agent tasks; MCP earns its complexity only for
+  centralized auth, structured tool discovery, or multi-service orchestration.
+  Most production systems end up using both.
+
+- **Better Stack — "Playwright CLI vs. MCP: Browser Automation for Coding Agents"**
+  https://betterstack.com/community/guides/ai/playwright-cli-vs-mcp-browser/
+  A concrete case study: the Playwright CLI beat the MCP server on token efficiency
+  ("pay-as-you-go" commands vs large upfront schema cost) and composability for
+  coding agents in a fixed context window.
