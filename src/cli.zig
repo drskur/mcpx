@@ -85,6 +85,7 @@ pub fn writeUsage(io: Io) !void {
         \\  auth <server>
         \\  list <server>
         \\  call <server> <tool> [json_args]
+        \\    Use - as json_args to read JSON from stdin.
         \\  skills <server> [tool]
         \\
         \\Omitting the command lists a server's tools, or calls the named tool.

@@ -54,10 +54,10 @@ fn renderPreamble(out: *Io.Writer, ctx: Context, tool_count: usize) !void {
     try ctx.writePrefix(out);
     try out.print("auth {s}` — force a fresh OAuth authorization when the server requires one\n\n", .{ctx.server});
     try out.writeAll(
-        \\Argument rules: the JSON must arrive as a single shell argument and must be an
-        \\object; omit it to send `{}`. On success mcpx prints the server's JSON result and
-        \\exits `0`. Exit `6` means the tool ran and reported `isError`; exit `7` means the
-        \\tool needs more input.
+        \\Argument rules: the JSON must be an object. Pass it as a single shell argument,
+        \\or pass `-` to read it from stdin; omit it to send `{}`. On success mcpx prints
+        \\the server's JSON result and exits `0`. Exit `6` means the tool ran and reported
+        \\`isError`; exit `7` means the tool needs more input.
         \\
         \\
     );
@@ -268,6 +268,7 @@ test "renderDocument explains the mcpx commands and honors the config flag" {
     try std.testing.expect(std.mem.startsWith(u8, text, "# MCP server `demo`\n"));
     try std.testing.expect(std.mem.indexOf(u8, text, "mcpx -c my.toml list demo`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "mcpx -c my.toml call demo search '{}'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pass `-` to read it from stdin") != null);
 }
 
 test "renderDocument reports an empty tool list without an invocation section" {

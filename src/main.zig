@@ -147,9 +147,10 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
     // the JSON fails immediately and without any network traffic.
     const call_args: ?Value = if (std.mem.eql(u8, parsed.command, "call")) blk: {
         const args_text = if (parsed.positionals_len > 2) parsed.positionals[2] else "{}";
-        const value = std.json.parseFromSliceLeaky(Value, allocator, args_text, .{}) catch return error.ArgsNotValidJson;
-        if (value != .object) return error.ArgsMustBeObject;
-        break :blk value;
+        if (!std.mem.eql(u8, args_text, "-")) break :blk try parseCallArgs(allocator, args_text);
+        var stdin_buffer: [4096]u8 = undefined;
+        var stdin = Io.File.stdin().reader(io, &stdin_buffer);
+        break :blk try parseCallArgsFromReader(allocator, &stdin.interface);
     } else null;
     try client.connect();
 
@@ -186,6 +187,17 @@ fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Conf
             try skills.renderDocument(out, allocator, ctx, &.{tool});
         } else try skills.renderDocument(out, allocator, ctx, tools);
     } else unreachable; // cli.parseArgs rejects every other command
+}
+
+fn parseCallArgs(allocator: Allocator, text: []const u8) !Value {
+    const value = std.json.parseFromSliceLeaky(Value, allocator, text, .{}) catch return error.ArgsNotValidJson;
+    if (value != .object) return error.ArgsMustBeObject;
+    return value;
+}
+
+fn parseCallArgsFromReader(allocator: Allocator, reader: *Io.Reader) !Value {
+    const text = try reader.allocRemaining(allocator, .unlimited);
+    return parseCallArgs(allocator, std.mem.trim(u8, text, " \t\r\n"));
 }
 
 fn isToolError(result: Value) bool {
@@ -459,4 +471,32 @@ test "call arguments must be a JSON object" {
         config,
         &output.writer,
     ));
+}
+
+test "call arguments support stdin, inline JSON, and the default object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stdin = Io.Reader.fixed("  {\"query\":\"stdin\"}\n");
+    const from_stdin = try parseCallArgsFromReader(allocator, &stdin);
+    try std.testing.expectEqualStrings("stdin", from_stdin.object.get("query").?.string);
+
+    const inline_args = try parseCallArgs(allocator, "{\"query\":\"inline\"}");
+    try std.testing.expectEqualStrings("inline", inline_args.object.get("query").?.string);
+
+    const default = try parseCallArgs(allocator, "{}");
+    try std.testing.expectEqual(@as(usize, 0), default.object.count());
+}
+
+test "stdin call arguments report invalid JSON and non-objects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var invalid = Io.Reader.fixed(" not json\n");
+    try std.testing.expectError(error.ArgsNotValidJson, parseCallArgsFromReader(allocator, &invalid));
+
+    var array = Io.Reader.fixed(" [1, 2]\n");
+    try std.testing.expectError(error.ArgsMustBeObject, parseCallArgsFromReader(allocator, &array));
 }
