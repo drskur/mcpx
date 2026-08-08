@@ -124,6 +124,8 @@ fn validateConfig(config: Config) !void {
 }
 
 fn runCommand(allocator: Allocator, io: Io, parsed: cli.ParsedArgs, config: Config, token_path: []const u8, out: *Io.Writer) !void {
+    // parseArgs normalizes verb-less invocations to list or call, so shorthand
+    // and explicit commands share the same dispatch and validation below.
     if (std.mem.eql(u8, parsed.command, "servers")) {
         if (config.http.len == 0) return out.writeAll("no servers configured.\n");
         for (config.http) |s| try out.print("{s}\t{s}{s}\n", .{ s.name, s.endpoint, if (s.oauth != null) " [oauth]" else "" });

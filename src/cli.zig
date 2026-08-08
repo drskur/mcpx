@@ -52,7 +52,15 @@ pub fn parseArgs(args: []const []const u8) !ParsedArgs {
         .positionals_len = 0,
         .help = true,
     };
-    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "auth")) 1 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else return error.UnknownCommand;
+    const needed: usize = if (std.mem.eql(u8, cmd, "servers")) 0 else if (std.mem.eql(u8, cmd, "auth")) 1 else if (std.mem.eql(u8, cmd, "list")) 1 else if (std.mem.eql(u8, cmd, "call")) 2 else if (std.mem.eql(u8, cmd, "skills")) 1 else {
+        if (count == positions.len) return error.TooManyArguments;
+        var index = count;
+        while (index > 0) : (index -= 1) positions[index] = positions[index - 1];
+        positions[0] = cmd;
+        count += 1;
+        const default_command = if (count == 1) "list" else "call";
+        return .{ .config = config, .command = default_command, .positionals = positions, .positionals_len = count };
+    };
     if (count < needed) return error.MissingArgument;
     return .{ .config = config, .command = cmd, .positionals = positions, .positionals_len = count };
 }
@@ -70,6 +78,7 @@ pub fn writeUsage(io: Io) !void {
     try file.interface.writeAll(
         \\
         \\Usage: mcpx [-c PATH] <COMMAND>
+        \\       mcpx [-c PATH] <server> [tool] [json_args]
         \\
         \\Commands:
         \\  servers
@@ -77,6 +86,9 @@ pub fn writeUsage(io: Io) !void {
         \\  list <server>
         \\  call <server> <tool> [json_args]
         \\  skills <server> [tool]
+        \\
+        \\Omitting the command lists a server's tools, or calls the named tool.
+        \\Command names are reserved and take priority over server names.
         \\
     );
     try file.interface.flush();
@@ -94,8 +106,19 @@ test "argument parser treats no arguments as help" {
     try std.testing.expect(parsed.help);
 }
 
-test "argument parser rejects unknown command" {
-    try std.testing.expectError(error.UnknownCommand, parseArgs(&.{ "mcpx", "wat" }));
+test "argument parser defaults server to list" {
+    const parsed = try parseArgs(&.{ "mcpx", "demo" });
+    try std.testing.expectEqualStrings("list", parsed.command);
+    try std.testing.expectEqual(@as(usize, 1), parsed.positionals_len);
+    try std.testing.expectEqualStrings("demo", parsed.positionals[0]);
+}
+
+test "argument parser defaults server and tool to call" {
+    const parsed = try parseArgs(&.{ "mcpx", "demo", "search" });
+    try std.testing.expectEqualStrings("call", parsed.command);
+    try std.testing.expectEqual(@as(usize, 2), parsed.positionals_len);
+    try std.testing.expectEqualStrings("demo", parsed.positionals[0]);
+    try std.testing.expectEqualStrings("search", parsed.positionals[1]);
 }
 
 test "argument parser rejects missing argument" {
@@ -116,6 +139,28 @@ test "argument parser accepts auth command" {
     const parsed = try parseArgs(&.{ "mcpx", "auth", "demo" });
     try std.testing.expectEqualStrings("auth", parsed.command);
     try std.testing.expectEqualStrings("demo", parsed.positionals[0]);
+}
+
+test "argument parser gives recognized commands priority" {
+    const list = try parseArgs(&.{ "mcpx", "list", "demo" });
+    try std.testing.expectEqualStrings("list", list.command);
+    try std.testing.expectEqualStrings("demo", list.positionals[0]);
+
+    const call = try parseArgs(&.{ "mcpx", "call", "demo", "search" });
+    try std.testing.expectEqualStrings("call", call.command);
+    try std.testing.expectEqualStrings("demo", call.positionals[0]);
+    try std.testing.expectEqualStrings("search", call.positionals[1]);
+
+    const skills = try parseArgs(&.{ "mcpx", "skills", "demo" });
+    try std.testing.expectEqualStrings("skills", skills.command);
+    const auth = try parseArgs(&.{ "mcpx", "auth", "demo" });
+    try std.testing.expectEqualStrings("auth", auth.command);
+}
+
+test "argument parser keeps servers as a command without positionals" {
+    const parsed = try parseArgs(&.{ "mcpx", "servers" });
+    try std.testing.expectEqualStrings("servers", parsed.command);
+    try std.testing.expectEqual(@as(usize, 0), parsed.positionals_len);
 }
 
 test "argument parser rejects unknown options instead of taking them as arguments" {
