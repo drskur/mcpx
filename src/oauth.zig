@@ -34,6 +34,9 @@ const acceptCallback = callback.acceptCallback;
 pub const OauthConfig = struct {
     client_id: ?[]const u8 = null,
     scopes: ?[]const u8 = null,
+    authorization_endpoint: ?[]const u8 = null,
+    token_endpoint: ?[]const u8 = null,
+    issuer: ?[]const u8 = null,
     register: bool = false,
     /// Request a refresh token from providers such as Google. Disabled by
     /// default because it is not part of the general MCP OAuth profile.
@@ -55,11 +58,37 @@ const tokenFromResponse = token_mod.tokenFromResponse;
 const registerClient = registration.registerClient;
 const canonicalResourceUri = oauth_url.canonicalResourceUri;
 const formField = oauth_url.formField;
+const requireSecureUrl = oauth_url.requireSecureUrl;
 const tokenKey = keys.tokenKey;
 const tokenMatches = keys.tokenMatches;
 const findIssuerCredentials = keys.findIssuerCredentials;
 
 pub const OauthChallenge = metadata_mod.Challenge;
+
+fn buildStaticMetadata(allocator: Allocator, config: OauthConfig) !?Metadata {
+    const has_authorization = config.authorization_endpoint != null;
+    const has_token = config.token_endpoint != null;
+    const has_issuer = config.issuer != null;
+    if (!has_authorization and !has_token and !has_issuer) return null;
+    // The issuer is deliberately required instead of inferred: it is the
+    // security boundary used to bind stored tokens and client credentials.
+    if (!has_authorization or !has_token or !has_issuer)
+        return error.OauthStaticMetadataIncomplete;
+    try requireSecureUrl(allocator, config.authorization_endpoint.?);
+    try requireSecureUrl(allocator, config.token_endpoint.?);
+    try requireSecureUrl(allocator, config.issuer.?);
+    return .{
+        .issuer = config.issuer.?,
+        .authorization_endpoint = config.authorization_endpoint.?,
+        .token_endpoint = config.token_endpoint.?,
+        .registration_endpoint = null,
+        .authorization_response_iss_parameter_supported = false,
+    };
+}
+
+fn resolveMetadata(allocator: Allocator, http: *std.http.Client, endpoint: []const u8, config: OauthConfig, challenge: ?OauthChallenge) !Metadata {
+    return try buildStaticMetadata(allocator, config) orelse discoverMetadata(allocator, http, endpoint, challenge);
+}
 
 pub fn parseWwwAuthenticate(allocator: Allocator, header: []const u8) !OauthChallenge {
     const first_space = std.mem.indexOfScalar(u8, header, ' ') orelse return .{};
@@ -102,7 +131,7 @@ pub fn ensureToken(
 ) !Token {
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
-    const metadata = try discoverMetadata(allocator, http, endpoint, null);
+    const metadata = try resolveMetadata(allocator, http, endpoint, config, null);
     const resource = try canonicalResourceUri(allocator, endpoint);
     const key = try tokenKey(allocator, metadata.issuer, resource);
     if (tokens.get(key)) |stored| {
@@ -130,7 +159,7 @@ pub fn forceAuthenticate(
 ) !Token {
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
-    const metadata = try discoverMetadata(allocator, http, endpoint, null);
+    const metadata = try resolveMetadata(allocator, http, endpoint, config, null);
     return authenticateAndStore(allocator, io, http, metadata, endpoint, config, token_path, &tokens);
 }
 
@@ -145,7 +174,7 @@ pub fn recoverUnauthorized(
 ) !Token {
     var tokens = try loadTokens(io, allocator, token_path);
     defer tokens.deinit(allocator);
-    const metadata = try discoverMetadata(allocator, http, endpoint, challenge);
+    const metadata = try resolveMetadata(allocator, http, endpoint, config, challenge);
     const resource = try canonicalResourceUri(allocator, endpoint);
     const key = try tokenKey(allocator, metadata.issuer, resource);
     if (tokens.get(key)) |stored| if (tokenMatches(stored, metadata.issuer, resource) and stored.refresh_token != null) {
@@ -245,6 +274,40 @@ test "authorization response issuer follows metadata advertisement" {
     try std.testing.expectError(error.OauthAuthorizationIssuerMissing, validateAuthorizationIssuer("https://issuer.example", null, true));
     try validateAuthorizationIssuer("https://issuer.example", null, false);
     try std.testing.expectError(error.OauthAuthorizationIssuerMismatch, validateAuthorizationIssuer("https://issuer.example", "https://other.example", false));
+}
+
+test "static OAuth config builds metadata without discovery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var http: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer http.deinit();
+    // This endpoint cannot be parsed for discovery, so success proves the
+    // configured metadata path was selected before any discovery attempt.
+    const metadata = try resolveMetadata(allocator, &http, "://invalid", .{
+        .authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth",
+        .token_endpoint = "https://oauth2.googleapis.com/token",
+        .issuer = "https://accounts.google.com",
+    }, null);
+    try std.testing.expectEqualStrings("https://accounts.google.com", metadata.issuer);
+    try std.testing.expectEqualStrings("https://accounts.google.com/o/oauth2/v2/auth", metadata.authorization_endpoint);
+    try std.testing.expectEqualStrings("https://oauth2.googleapis.com/token", metadata.token_endpoint);
+    try std.testing.expectEqual(@as(?[]const u8, null), metadata.registration_endpoint);
+    try std.testing.expect(!metadata.authorization_response_iss_parameter_supported);
+}
+
+test "static OAuth config must include both endpoints and issuer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectEqual(@as(?Metadata, null), try buildStaticMetadata(allocator, .{}));
+    try std.testing.expectError(error.OauthStaticMetadataIncomplete, buildStaticMetadata(allocator, .{
+        .authorization_endpoint = "https://accounts.example/authorize",
+    }));
+    try std.testing.expectError(error.OauthStaticMetadataIncomplete, buildStaticMetadata(allocator, .{
+        .authorization_endpoint = "https://accounts.example/authorize",
+        .token_endpoint = "https://accounts.example/token",
+    }));
 }
 
 test "metadata and token response security fields are enforced" {

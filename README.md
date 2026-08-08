@@ -36,6 +36,24 @@ access_type_offline = true    # optional: request a refresh token (for example, 
 prompt_consent = true         # optional: force re-consent so Google can reissue one
 ```
 
+Servers without OAuth discovery endpoints can configure static metadata. All
+three fields are required together. For Google Calendar or Gmail MCP servers:
+
+```toml
+[[http]]
+name = "google-calendar"
+endpoint = "https://calendarmcp.googleapis.com/mcp"
+
+[http.oauth]
+client_id = "your-google-oauth-client-id"
+scopes = "openid email https://www.googleapis.com/auth/calendar"
+authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+token_endpoint = "https://oauth2.googleapis.com/token"
+issuer = "https://accounts.google.com"
+access_type_offline = true
+prompt_consent = true
+```
+
 The default timeout is 30 seconds; `timeout_secs = 0` is rejected. Pass
 `-c <path>` or `--config=<path>` to use another configuration file. Server
 entries are validated before any request: names must be unique and non-empty,
@@ -49,6 +67,8 @@ metadata URL is only followed when it stays on the resource server's own
 origin, and every advertised authorization server is tried in order. Issuer,
 authorization, token and registration URLs must use `https`, except on loopback
 hosts.
+When static `authorization_endpoint`, `token_endpoint`, and `issuer` values are
+configured, mcpx uses them directly and skips discovery.
 
 mcpx uses Authorization Code with PKCE (S256), opens the authorization URL with
 `xdg-open` on Linux, and waits up to 300 seconds for a redirect to an ephemeral

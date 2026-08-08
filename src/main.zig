@@ -249,6 +249,9 @@ test "config parses servers via toml library" {
         \\[http.oauth]
         \\client_id = "client"
         \\scopes = "read write"
+        \\authorization_endpoint = "https://accounts.example/authorize"
+        \\token_endpoint = "https://accounts.example/token"
+        \\issuer = "https://accounts.example"
         \\register = false
         \\access_type_offline = true
         \\prompt_consent = true
@@ -261,6 +264,9 @@ test "config parses servers via toml library" {
     try std.testing.expectEqual(@as(u64, 60), config.http[1].timeoutSecs());
     try std.testing.expectEqualStrings("client", config.http[1].oauth.?.client_id.?);
     try std.testing.expectEqualStrings("read write", config.http[1].oauth.?.scopes.?);
+    try std.testing.expectEqualStrings("https://accounts.example/authorize", config.http[1].oauth.?.authorization_endpoint.?);
+    try std.testing.expectEqualStrings("https://accounts.example/token", config.http[1].oauth.?.token_endpoint.?);
+    try std.testing.expectEqualStrings("https://accounts.example", config.http[1].oauth.?.issuer.?);
     try std.testing.expect(config.http[1].oauth.?.access_type_offline);
     try std.testing.expect(config.http[1].oauth.?.prompt_consent);
     const headers = config.http[0].headers.?;
