@@ -70,18 +70,32 @@ fn validateRpcResponse(allocator: Allocator, rpc: Value, expected_id: i64, diagn
             .message = message,
             .data = get(err_value, "data"),
         });
-        if (code_value.integer == -32022) return error.UnsupportedProtocolVersionError;
+        // A protocol-version negotiation response is recognized structurally
+        // by a `data.supported` array, not only by the MCP-spec code -32022:
+        // servers such as Bedrock AgentCore emit -32600 (Invalid Request).
+        if (code_value.integer == -32022 or dataHasSupportedList(err_value))
+            return error.UnsupportedProtocolVersionError;
         if (code_value.integer == -32601) return error.MethodNotFound;
         return error.JsonRpcError;
     }
     return result.?;
 }
 
+/// Returns true when `rpc_error.data.supported` is an object field whose value
+/// is an array, the structural shape of a protocol-version negotiation reply.
+/// The JSON-RPC error code is advisory: the MCP spec uses -32022, but other
+/// servers (e.g. Bedrock AgentCore) use -32600, so detection keys on shape.
+fn dataHasSupportedList(rpc_error: Value) bool {
+    const data = get(rpc_error, "data") orelse return false;
+    if (data != .object) return false;
+    const supported = get(data, "supported") orelse return false;
+    return supported == .array;
+}
+
 pub fn supportedVersionsFromError(allocator: Allocator, text: []const u8, expected_id: i64) !?[]const []const u8 {
     const envelope = try parseJson(allocator, text);
     if (!responseIdMatches(envelope, expected_id)) return null;
     const rpc_error = get(envelope, "error") orelse return null;
-    if (getInteger(rpc_error, "code") != -32022) return null;
     const data = get(rpc_error, "data") orelse return null;
     const supported = get(data, "supported") orelse return null;
     if (supported != .array) return error.InvalidSupportedProtocolVersions;
@@ -271,6 +285,18 @@ test "unsupported protocol error exposes supported versions" {
     const supported = (try supportedVersionsFromError(arena.allocator(), text, 1)).?;
     try std.testing.expectEqual(@as(usize, 2), supported.len);
     try std.testing.expectEqualStrings("2026-07-28", supported[1]);
+}
+
+test "unsupported protocol version is detected from a non-spec error code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Bedrock AgentCore negotiates with code -32600 (Invalid Request) instead
+    // of the MCP-spec -32022; detection keys on the `data.supported` array.
+    const text = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"Unsupported protocol version: 2026-07-28\",\"data\":{\"supported\":[\"2025-03-26\"],\"requested\":\"2026-07-28\"}}}";
+    try std.testing.expectError(error.UnsupportedProtocolVersionError, parseRpc(arena.allocator(), text, 1));
+    const supported = (try supportedVersionsFromError(arena.allocator(), text, 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), supported.len);
+    try std.testing.expectEqualStrings("2025-03-26", supported[0]);
 }
 
 test "validateRpcResponse rejects non-2.0 jsonrpc" {
